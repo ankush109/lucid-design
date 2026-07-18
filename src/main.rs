@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "macos"))]
+compile_error!("design-gen only runs on macOS (requires WKWebView + Cocoa).");
+
 mod ai;
 mod config;
 mod knowledge;
@@ -68,7 +71,7 @@ fn main() -> Result<()> {
     install_mac_menu();
 
     let stop_for_ipc = stop_flag.clone();
-    let webview = WebViewBuilder::new(&window)
+    let webview = WebViewBuilder::new()
         .with_devtools(true)
         .with_html(include_str!("assets/ui.html"))
         .with_ipc_handler(move |req: wry::http::Request<String>| {
@@ -80,7 +83,7 @@ fn main() -> Result<()> {
                 let _ = ipc_tx.send(msg);
             }
         })
-        .build()?;
+        .build(&window)?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
