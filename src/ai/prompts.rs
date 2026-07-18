@@ -248,15 +248,23 @@ naming the archetype you chose, exactly in this form:
 
 <meta name=\"archetype\" content=\"bento\">  (or editorial, split-screen, single-column, card-grid, sidebar, z-pattern, magazine, masonry)
 
+CRITICAL — match the design TYPE to the idea:
+- Dashboard / analytics tool → sidebar nav, data cards, charts, tables, stat widgets. NOT a landing page.
+- Portfolio / personal site → project grid, about section, contact. NOT a landing page.
+- Admin panel / internal tool → dense layout, nav rail, data tables, filters. NOT a landing page.
+- SaaS marketing site / product launch → hero, features, pricing, CTA. This is the landing page pattern.
+- App UI / product screen → actual app chrome: topbar, sidebar, content area with real UI components.
+- Blog / editorial → masthead, article grid, typography-first layout.
+Read the idea carefully and produce the RIGHT type of interface.
+
 Rules:
 - Full visual design: color tokens as CSS custom properties, ratio-derived \
 type scale, tinted neutrals, defined hover/focus/active states, one signature \
 element specific to the subject.
 - Realistic content for the product — never Lorem Ipsum.
-- Use image tags with REAL src URLs from the IMAGE TOOLKIT. Include a hero \
-image (16:9 or 3:2), feature imagery, and avatars for social proof.
-- Include section ids: id=\"nav\", id=\"hero\", id=\"features\", id=\"pricing\" \
-(or similar), id=\"cta\", id=\"footer\". These enable the section streamer.
+- Use image tags with REAL src URLs from the IMAGE TOOLKIT matched to the subject.
+- Give top-level sections meaningful ids matching the UI type (e.g. id=\"sidebar\", \
+id=\"dashboard\", id=\"stats\" for a dashboard; id=\"projects\", id=\"about\" for a portfolio).
 - Responsive; mobile is not desktop-minus.
 - Follow the ANTI-TELLS in the knowledge base.
 
