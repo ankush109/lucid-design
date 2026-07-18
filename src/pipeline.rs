@@ -688,7 +688,7 @@ async fn handle_assemble(
         format!("Filling {} placeholders for \"{}\"…", all_placeholders.len(), idea)
     ));
 
-    let system = "You are a UX copywriter filling placeholders for a landing page. \
+    let system = "You are a UX copywriter filling placeholders for a web interface (could be a landing page, dashboard, product UI, admin panel, portfolio, or any other type). \
 Output STRICTLY a JSON object mapping each placeholder key (uppercase, underscored) \
 to a concrete filled string. Follow these rules:\n\
 - Use specific nouns from the subject's world, never generic benefit words.\n\

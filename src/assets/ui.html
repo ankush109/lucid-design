@@ -978,7 +978,7 @@
     <div class="messages" id="messages">
       <div class="msg assistant">
         <span class="msg-label">Assistant</span>
-        <div class="bubble">What are we designing? Try <em>a scheduling tool for freelance photographers</em> — or paste a reference URL like <em>"beat https://linear.app for a personal CRM"</em> and I'll extract its palette, fonts, and structure to aim higher. Theme comes next.</div>
+        <div class="bubble">What are we designing? A landing page, dashboard, product UI, portfolio, admin panel — anything. Try <em>a dashboard for a fitness tracking app</em> or <em>a portfolio for a motion designer</em> — or paste a reference URL like <em>"beat https://linear.app"</em> and I'll extract its palette and structure to aim higher.</div>
       </div>
     </div>
 
@@ -2180,7 +2180,7 @@
     if (list.length === 0) {
       // Fresh chat: friendly greeting (not persisted so we don't nag on empty projects).
       renderMsgDom('assistant', 'Assistant',
-        'What are we designing? Try "a scheduling tool for freelance photographers" or paste a reference URL like "make something better than https://linear.app". I\'ll ask about the theme next.');
+        'What are we designing? A landing page, dashboard, product UI, portfolio, admin panel — anything. Try "a dashboard for a fitness tracking app" or "a portfolio for a motion designer". Or paste a reference URL to extract its palette and structure.');
       return;
     }
     for (const entry of list) {
