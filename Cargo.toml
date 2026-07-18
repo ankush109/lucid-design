@@ -1,5 +1,5 @@
 [package]
-name = "design-gen"
+name = "lucid-design"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ankush Banerjee <banerjeeankush184@gmail.com>"]
