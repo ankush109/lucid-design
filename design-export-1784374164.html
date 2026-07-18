@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PulseForge — Dark Mode Fitness Tracking & Coaching</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; color: #333; background: #fff; line-height: 1.5; }
+  a { color: #333; text-decoration: none; }
+  img { max-width: 100%; display: block; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+  section { border-bottom: 1px solid #ddd; padding: 64px 0; }
+  h1 { font-size: 48px; margin-bottom: 16px; }
+  h2 { font-size: 32px; margin-bottom: 12px; }
+  h3 { font-size: 20px; margin-bottom: 8px; }
+  p { margin-bottom: 12px; }
+  ul { list-style: none; }
+  button, .btn { border: 1px solid #ddd; background: #fff; color: #333; padding: 12px 24px; font-size: 16px; font-family: inherit; cursor: pointer; }
+
+  /* Nav */
+  #site-nav { border-bottom: 1px solid #ddd; padding: 16px 0; position: sticky; top: 0; background: #fff; }
+  #site-nav .nav-inner { display: flex; align-items: center; justify-content: space-between; }
+  #site-nav .logo { font-weight: 700; font-size: 20px; }
+  #site-nav ul { display: flex; gap: 24px; }
+  #site-nav .nav-actions { display: flex; gap: 12px; }
+
+  /* Hero */
+  #hero .hero-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 48px; align-items: center; }
+  #hero .hero-cta { display: flex; gap: 12px; margin-top: 24px; }
+  #hero .hero-stats { display: flex; gap: 32px; margin-top: 32px; }
+  #hero .stat-num { font-size: 24px; font-weight: 700; }
+  #hero .hero-visual { border: 1px solid #ddd; aspect-ratio: 3/4; display: flex; align-items: center; justify-content: center; color: #333; }
+
+  /* App preview strip */
+  #app-preview .preview-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-top: 32px; }
+  #app-preview .screen { border: 1px solid #ddd; aspect-ratio: 9/16; display: flex; align-items: center; justify-content: center; padding: 16px; text-align: center; }
+
+  /* Features */
+  #features .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-top: 32px; }
+  #features .feature-card { border: 1px solid #ddd; padding: 24px; }
+  #features .icon-box { width: 48px; height: 48px; border: 1px solid #ddd; margin-bottom: 16px; display: flex; align-items: center; justify-content: center; }
+
+  /* Workouts */
+  #workouts .workout-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 32px; }
+  #workouts .workout-card { border: 1px solid #ddd; padding: 16px; }
+  #workouts .workout-thumb { border: 1px solid #ddd; aspect-ratio: 4/3; margin-bottom: 12px; display: flex; align-items: center; justify-content: center; }
+  #workouts .meta { display: flex; justify-content: space-between; font-size: 14px; margin-top: 8px; }
+
+  /* How it works */
+  #how-it-works .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; margin-top: 32px; }
+  #how-it-works .step { border: 1px solid #ddd; padding: 24px; }
+  #how-it-works .step-num { font-size: 14px; color: #333; margin-bottom: 8px; }
+
+  /* Social proof */
+  #social-proof .logos { display: flex; justify-content: space-between; align-items: center; margin: 32px 0; flex-wrap: wrap; gap: 24px; }
+  #social-proof .logo-item { border: 1px solid #ddd; padding: 16px 32px; }
+  #social-proof .testimonial-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-top: 32px; }
+  #social-proof .testimonial { border: 1px solid #ddd; padding: 24px; }
+  #social-proof .author { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+  #social-proof .avatar { width: 40px; height: 40px; border: 1px solid #ddd; border-radius: 50%; }
+
+  /* Coaches */
+  #coaches .coach-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; margin-top: 32px; }
+  #coaches .coach { border: 1px solid #ddd; padding: 16px; }
+  #coaches .coach-photo { border: 1px solid #ddd; aspect-ratio: 1/1; margin-bottom: 12px; }
+
+  /* Pricing */
+  #pricing .plan-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-top: 32px; }
+  #pricing .plan { border: 1px solid #ddd; padding: 32px; }
+  #pricing .price { font-size: 36px; font-weight: 700; margin: 16px 0; }
+  #pricing .plan ul { margin: 16px 0; }
+  #pricing .plan li { padding: 8px 0; border-bottom: 1px solid #ddd; }
+
+  /* FAQ */
+  #faq .faq-list { margin-top: 32px; }
+  #faq .faq-item { border: 1px solid #ddd; padding: 20px; margin-bottom: 12px; }
+  #faq .faq-q { font-weight: 600; margin-bottom: 8px; }
+
+  /* CTA */
+  #cta { text-align: center; }
+  #cta .cta-buttons { display: flex; gap: 12px; justify-content: center; margin-top: 24px; }
+  #cta .store-btn { border: 1px solid #ddd; padding: 12px 24px; }
+
+  /* Footer */
+  #site-footer { padding: 48px 0 24px; }
+  #site-footer .footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr; gap: 32px; }
+  #site-footer h4 { font-size: 14px; margin-bottom: 16px; text-transform: uppercase; }
+  #site-footer ul li { padding: 4px 0; font-size: 14px; }
+  #site-footer .footer-bottom { display: flex; justify-content: space-between; margin-top: 32px; padding-top: 24px; border-top: 1px solid #ddd; font-size: 14px; }
+
+  @media (max-width: 768px) {
+    #hero .hero-grid, #app-preview .preview-grid, #features .feature-grid,
+    #workouts .workout-grid, #how-it-works .steps, #social-proof .testimonial-grid,
+    #coaches .coach-grid, #pricing .plan-grid, #site-footer .footer-grid { grid-template-columns: 1fr; }
+    #site-nav ul { display: none; }
+    h1 { font-size: 32px; }
+  }
+</style>
+</head>
+<body>
+
+<nav id="site-nav">
+  <div class="container nav-inner">
+    <div class="logo">PulseForge</div>
+    <ul>
+      <li><a href="#features">Features</a></li>
+      <li><a href="#workouts">Workouts</a></li>
+      <li><a href="#coaches">Coaches</a></li>
+      <li><a href="#pricing">Pricing</a></li>
+      <li><a href="#faq">FAQ</a></li>
+    </ul>
+    <div class="nav-actions">
+      <a href="#login" class="btn">Log In</a>
+      <a href="#download" class="btn">Get the App</a>
+    </div>
+  </div>
+</nav>
+
+<section id="hero">
+  <div class="container">
+    <div class="hero-grid">
+      <div>
+        <h1>Train harder. Recover smarter. All in dark mode.</h1>
+        <p>PulseForge is your all-in-one fitness companion — track lifts, follow adaptive programs, and sync recovery metrics from your wearable. Designed to be easy on your eyes at 5:30 AM and 11:00 PM.</p>
+        <div class="hero-cta">
+          <a href="#download" class="btn">Download for iOS</a>
+          <a href="#download" class="btn">Download for Android</a>
+        </div>
+        <div class="hero-stats">
+          <div>
+            <div class="stat-num">2.4M+</div>
+            <div>Active lifters</div>
+          </div>
+          <div>
+            <div class="stat-num">180+</div>
+            <div>Guided programs</div>
+          </div>
+          <div>
+            <div class="stat-num">4.9★</div>
+            <div>App Store rating</div>
+          </div>
+        </div>
+      </div>
+      <div class="hero-visual">[App Screen Preview — Home Dashboard]</div>
+    </div>
+  </div>
+</section>
+
+<section id="app-preview">
+  <div class="container">
+    <h2>Every workout, dialed in</h2>
+    <p>From strength blocks to HIIT finishers — the whole session lives on one screen.</p>
+    <div class="preview-grid">
+      <div class="screen">[Workout Timer Screen]</div>
+      <div class="screen">[Lift Logger Screen]</div>
+      <div class="screen">[Recovery & Sleep Screen]</div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="container">
+    <h2>Built for people who actually train</h2>
+    <p>Skip the toy features. PulseForge focuses on what moves your numbers.</p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="icon-box">[icon]</div>
+        <h3>Adaptive Programming</h3>
+        <p>Your next session auto-adjusts based on RPE, sleep score, and last week's PRs. No more copying spreadsheets.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon-box">[icon]</div>
+        <h3>Wearable Sync</h3>
+        <p>Connects with Apple Watch, WHOOP, Garmin, Oura, and Fitbit — heart rate, HRV, and sleep all in one place.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon-box">[icon]</div>
+        <h3>Lift Library</h3>
+        <p>1,200+ exercises with slow-mo form videos, cueing notes, and variations for every equipment setup.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon-box">[icon]</div>
+        <h3>Macro & Meal Tracking</h3>
+        <p>Barcode scanner, restaurant database, and TDEE recalculations that update as your body weight shifts.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon-box">[icon]</div>
+        <h3>Progress Analytics</h3>
+        <p>Volume load, e1RM curves, and body composition trends — visualized in a dashboard you'll actually check.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon-box">[icon]</div>
+        <h3>OLED-First Design</h3>
+        <p>True black backgrounds, low-blue-light color palette, and a red-shift mode for late-night sessions.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="workouts">
+  <div class="container">
+    <h2>Featured programs</h2>
+    <p>Free with every membership. Filter by goal, equipment, and time.</p>
+    <div class="workout-grid">
+      <div class="workout-card">
+        <div class="workout-thumb">[Program Image]</div>
+        <h3>Iron Foundation</h3>
+        <p>5-day strength split for intermediate lifters</p>
+        <div class="meta"><span>12 weeks</span><span>60 min/day</span></div>
+      </div>
+      <div class="workout-card">
+        <div class="workout-thumb">[Program Image]</div>
+        <h3>Hybrid Athlete</h3>
+        <p>Zone 2 runs paired with lower-volume lifting</p>
+        <div class="meta"><span>8 weeks</span><span>75 min/day</span></div>
+      </div>
+      <div class="workout-card">
+        <div class="workout-thumb">[Program Image]</div>
+        <h3>Home Dumbbell Only</h3>
+        <p>Full-body hypertrophy with two dumbbells</p>
+        <div class="meta"><span>6 weeks</span><span>45 min/day</span></div>
+      </div>
+      <div class="workout-card">
+        <div class="workout-thumb">[Program Image]</div>
+        <h3>Cut & Conditioning</h3>
+        <p>Fat-loss protocol with HIIT and calorie targets</p>
+        <div class="meta"><span>10 weeks</span><span>50 min/day</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how-it-works">
+  <div class="container">
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">Step 01</div>
+        <h3>Take the intake quiz</h3>
+        <p>Tell us your training history, equipment, and goal. Takes about 3 minutes.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">Step 02</div>
+        <h3>Get your program</h3>
+        <p>PulseForge builds a personalized 12-week block with weekly milestones.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">Step 03</div>
+        <h3>Train & log</h3>
+        <p>Follow guided sessions with rest timers, plate math, and RPE prompts.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">Step 04</div>
+        <h3>Adapt weekly</h3>
+        <p>Your program tweaks itself based on recovery, missed sessions, and PRs.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="social-proof">
+  <div class="container">
+    <h2>Trusted by athletes and clinicians</h2>
+    <div class="logos">
+      <div class="logo-item">Men's Health</div>
+      <div class="logo-item">Outside</div>
+      <div class="logo-item">Runner's World</div>
+      <div class="logo-item">Barbell Medicine</div>
+      <div class="logo-item">The Athletic</div>
+    </div>
+    <div class="testimonial-grid">
+      <div class="testimonial">
+        <p>"Finally an app that doesn't blind me when I check my next set at 5 AM. The auto-deload feature saved my shoulders during a bad week."</p>
+        <div class="author">
+          <div class="avatar"></div>
+          <div>
+            <strong>Marcus Delgado</strong><br>
+            <small>Powerlifter, Denver CO</small>
+          </div>
+        </div>
+      </div>
+      <div class="testimonial">
+        <p>"I dropped 18 lbs and hit a 315 deadlift in six months following the Hybrid Athlete program. The Garmin sync is flawless."</p>
+        <div class="author">
+          <div class="avatar"></div>
+          <div>
+            <strong>Priya Nair</strong><br>
+            <small>Marathon runner, Boston MA</small>
+          </div>
+        </div>
+      </div>
+      <div class="testimonial">
+        <p>"I recommend PulseForge to every one of my rehab clients. The exercise library cues are clinically accurate — a rarity."</p>
+        <div class="author">
+          <div class="avatar"></div>
+          <div>
+            <strong>Dr. Elena Voss, DPT</strong><br>
+            <small>Sports Physio, Austin TX</small>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="coaches">
+  <div class="container">
+    <h2>Meet the coaches behind the programs</h2>
+    <p>Every program is authored by a certified strength or conditioning specialist.</p>
+    <div class="coach-grid">
+      <div class="coach">
+        <div class="coach-photo">[Coach Photo]</div>
+        <h3>Jordan Reyes, CSCS</h3>
+        <p>Powerlifting & hypertrophy. 12 years coaching, 500kg raw total.</p>
+      </div>
+      <div class="coach">
+        <div class="coach-photo">[Coach Photo]</div>
+        <h3>Amara Okafor, MS</h3>
+        <p>Endurance & hybrid training. Former USATF middle-distance coach.</p>
+      </div>
+      <div class="coach">
+        <div class="coach-photo">[Coach Photo]</div>
+        <h3>Kenji Tanaka, RD</h3>
+        <p>Sports nutrition. Author of "Fuel for Lifters" (2024).</p>
+      </div>
+      <div class="coach">
+        <div class="coach-photo">[Coach Photo]</div>
+        <h3>Sam Lindqvist, DPT</h3>
+        <p>Prehab & mobility. Consultant to two NCAA Division I programs.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="pricing">
+  <div class="container">
+    <h2>Simple, honest pricing</h2>
+    <p>Cancel anytime. All plans include a 14-day free trial.</p>
+    <div class="plan-grid">
+      <div class="plan">
+        <h3>Starter</h3>
+        <div class="price">$0<span style="font-size: 14px; font-weight: 400;">/mo</span></div>
+        <p>Log lifts and browse free programs</p>
+        <ul>
+          <li>Manual workout logging</li>
+          <li>3 free programs</li>
+          <li>Basic progress charts</li>
+          <li>Community forum access</li>
+        </ul>
+        <a href="#signup" class="btn">Start free</a>
+      </div>
+      <div class="plan">
+        <h3>Pro</h3>
+        <div class="price">$14.99<span style="font-size: 14px; font-weight: 400;">/mo</span></div>
+        <p>Adaptive programming and full library</p>
+        <ul>
+          <li>All 180+ programs</li>
+          <li>Adaptive RPE-based adjustments</li>
+          <li>Wearable sync (Apple, Garmin, WHOOP)</li>
+          <li>Macro tracking + barcode scanner</li>
+          <li>Advanced analytics dashboard</li>
+        </ul>
+        <a href="#signup" class="btn">Start 14-day trial</a>
+      </div>
+      <div class="plan">
+        <h3>Coach</h3>
+        <div class="price">$39<span style="font-size: 14px; font-weight: 400;">/mo</span></div>
+        <p>Everything in Pro + 1:1 coaching</p>
+        <ul>
+          <li>Everything in Pro</li>
+          <li>Monthly video check-in</li>
+          <li>Custom program builds</li>
+          <li>Async messaging with your coach</li>
+          <li>Priority support</li>
+        </ul>
+        <a href="#signup" class="btn">Talk to a coach</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="container">
+    <h2>Frequently asked questions</h2>
+    <div class="faq-list">
+      <div class="faq-item">
+        <div class="faq-q">Does PulseForge only work in dark mode?</div>
+        <p>Dark is our default because most sessions happen in gyms with harsh lighting or at odd hours. A high-contrast light theme is available in Settings > Appearance.</p>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">Which wearables are supported?</div>
+        <p>Apple Watch (Series 4+), WHOOP 4.0, all Garmin watches from 2019 onward, Oura Ring Gen 3, and Fitbit Sense/Charge 5+. Polar sync is in beta.</p>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">Can I import data from Strong, Hevy, or MyFitnessPal?</div>
+        <p>Yes — we support CSV import from Strong and Hevy, and a direct API bridge with MyFitnessPal for nutrition history.</p>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">Is there an Apple Watch companion app?</div>
+        <p>Yes. The watch app runs standalone during workouts — log sets, start rest timers, and see heart rate zones without your phone.</p>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">What if I've never lifted before?</div>
+        <p>Our onboarding flow assesses experience honestly. Beginners are routed to the "First 90 Days" program with lighter loads and detailed video cues.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="cta">
+  <div class="container">
+    <h2>Your next PR is one download away</h2>
+    <p>Join 2.4 million lifters, runners, and hybrid athletes training with PulseForge.</p>
+    <div class="cta-buttons">
+      <a href="#ios" class="store-btn">Download on the App Store</a>
+      <a href="#android" class="store-btn">Get it on Google Play</a>
+    </div>
+  </div>
+</section>
+
+<footer id="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div>
+        <div class="logo" style="font-weight: 700; font-size: 20px; margin-bottom: 12px;">PulseForge</div>
+        <p style="font-size: 14px;">The dark-mode fitness app for serious training. Built in Brooklyn, NY.</p>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <ul>
+          <li>Features</li>
+          <li>Programs</li>
+          <li>Pricing</li>
+          <li>Wearable sync</li>
+          <li>Changelog</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Company</h4>
+        <ul>
+          <li>About</li>
+          <li>Careers</li>
+          <li>Press</li>
+          <li>Contact</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Resources</h4>
+        <ul>
+          <li>Blog</li>
+          <li>Coach directory</li>
+          <li>Help center</li>
+          <li>API docs</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Legal</h4>
+        <ul>
+          <li>Privacy</li>
+          <li>Terms</li>
+          <li>Cookies</li>
+          <li>HIPAA</li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <div>© 2026 PulseForge Labs, Inc. All rights reserved.</div>
+      <div>Twitter · Instagram · YouTube · TikTok</div>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

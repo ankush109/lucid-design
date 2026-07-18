@@ -1,0 +1,39 @@
+# design-gen configuration
+# Supported providers: claudecode, anthropic, openai, groq, mistral, together, ollama, gemini
+
+# Testing mode — uses your local Claude Code CLI, no API key needed
+provider = "claudecode"
+model    = ""
+api_key  = ""
+
+# --- Switch to a real provider when you have a key ---
+#
+# Anthropic:
+#   provider = "anthropic"
+#   model    = "claude-sonnet-4-6"
+#   api_key  = "sk-ant-..."
+#
+# OpenAI:
+#   provider = "openai"
+#   model    = "gpt-4o"
+#   api_key  = "sk-..."
+#
+# Groq (fast + free tier):
+#   provider = "groq"
+#   model    = "llama-3.3-70b-versatile"
+#   api_key  = "gsk_..."
+#
+# Mistral:
+#   provider = "mistral"
+#   model    = "mistral-large-latest"
+#   api_key  = "..."
+#
+# Ollama (local, no key needed):
+#   provider = "ollama"
+#   model    = "llama3"
+#   base_url = "http://localhost:11434"
+#
+# Google Gemini:
+#   provider = "gemini"
+#   model    = "gemini-1.5-pro"
+#   api_key  = "..."
