@@ -1,165 +1,131 @@
-# lucid-design
+# lucid design
 
-A native macOS app for generating high-quality single-file HTML designs. Pick sections from a hand-authored variant library, let the LLM fill the copy, swap sections zero-cost after the design lands.
+**A native macOS app that turns a one-line idea into a polished landing page.**
 
-Not a Figma clone. Not a template gallery. A **design kit configurator** — you choose nav / hero / features / testimonials / pricing / CTA / footer variants from a curated catalog, plus a palette and theme, and the assembler stitches them into one clean HTML file with real copy written by the LLM.
+Describe your product. Pick a style. Watch it assemble section by section. Swap any section with one click — zero AI tokens, zero wait. Export clean, self-contained HTML.
 
-Built in Rust (`tao` + `wry`) with a single-file HTML frontend rendered in WKWebView. One binary, no web server, no Electron.
+> Built in Rust · WKWebView · No Electron · No web server · One binary
 
 ---
 
 ## Install
 
 ```bash
-cargo install design-gen
+cargo install lucid-design
 ```
 
-First install compiles from source and takes ~2 minutes. Requires Xcode Command Line Tools.
-
-Or clone and build locally:
+Requires macOS 11+, Rust ([rustup.rs](https://rustup.rs)), and Xcode CLI tools.
 
 ```bash
-git clone https://github.com/ankush109/lucid-design
-cd lucid-design
-cargo build --release
-./target/release/design-gen
+xcode-select --install  # if you haven't already
 ```
 
-> **macOS only.** Requires macOS 11+ and Xcode CLI tools (`xcode-select --install`).
+First install compiles from source (~2 min). After that, just run:
+
+```bash
+lucid-design
+```
 
 ---
 
 ## Setup
 
-On first launch the app looks for `config.toml` in the current directory. Create one:
+Create `~/.config/lucid-design/config.toml` with your preferred LLM:
 
+**Claude Code (no API key needed)**
 ```toml
-provider = "claudecode"   # uses your local Claude Code CLI — no API key needed
+provider = "claudecode"
 model    = ""
 api_key  = ""
 ```
 
-**Other supported providers:**
+**Anthropic API**
+```toml
+provider = "anthropic"
+model    = "claude-sonnet-4-6"
+api_key  = "sk-ant-..."
+```
 
-| Provider | `provider` value | Notes |
-|---|---|---|
-| Claude Code CLI | `claudecode` | Uses the local `claude` binary. Free if you have Claude Code. |
-| Anthropic API | `anthropic` | Direct API with prompt caching (90% cost savings on repeat calls). |
-| OpenAI | `openai` | Set `api_key` and `model = "gpt-4o"`. |
-| Groq | `groq` | Fast inference, has a free tier. |
-| Ollama | `ollama` | Local models, no API key. Set `base_url = "http://localhost:11434/v1"`. |
-| Gemini | `gemini` | Google Gemini API. |
+**Other supported providers:** `openai`, `groq`, `ollama`, `gemini`
 
 ---
 
 ## How it works
 
-### 1. Describe your product
-
-Type your idea in the chat pane:
+**1. Describe your idea**
 
 ```
-a fitness tracking app landing page
+a project management tool for indie game studios
 ```
 
-A kit picker appears with chip rows for each section category — **Theme, Palette, Navbar, Hero, Features, Testimonials, Pricing, CTA, Footer**. Every row defaults to **Auto**. Leave everything on Auto for a fully-generated design. Pick specific variants where you have opinions.
+**2. Pick your kit** — or leave everything on Auto
 
-### 2. Build
+Choose from chips for Theme, Palette, Navbar, Hero, Features, Testimonials, Pricing, CTA, and Footer. One LLM call fills all the copy. Sections stream in top-down as they're assembled.
 
-Hit Send. The assembler:
+**3. Swap sections without spending tokens**
 
-1. Looks up each picked variant in the compiled library (17 hand-authored HTML fragments)
-2. Collects all placeholders — typically 40–80 unique keys like `{{HEADLINE}}`, `{{HERO_IMAGE_URL}}`, `{{T1_NAME}}`
-3. Makes **one LLM call** asking for a JSON dict mapping each placeholder to a filled string (specific copy, real image URLs, named testimonials)
-4. Interpolates the fills into the variant HTML
+Click any section on the canvas → pick an alternate variant from the panel → it swaps instantly. No LLM call. No wait. Undo with Cmd+Z.
 
-Sections stream into the canvas top-down with a brief fade-in per section so the build feels intentional.
+**4. Refine via chat**
 
-### 3. Swap sections zero-cost
+Type anything to edit the whole design. Click an element first to scope the change to just that part.
 
-Click any section on the canvas → a **↻ Swap this section** panel shows the alternate variants for that category. Click one → Rust splices the new variant in place, preserving content via structural mapping. **Zero LLM tokens.**
+**5. Export**
 
-### 4. Refine via chat
-
-Type anything after the design lands → the LLM edits the current HTML. Click an element first to scope the edit to just that element.
-
-### 5. Export
-
-**↓ Export HTML** saves a self-contained HTML file to `~/Documents/lucid-design/`. Open it in any browser — no server, no dependencies.
+One click → self-contained HTML file in `~/Documents/lucid-design/`. Open in any browser.
 
 ---
 
-## The variant library
+## What's in the library
 
-17 hand-authored HTML sections in `src/ai/variants.md`, compiled into the binary at build time:
+17 hand-authored HTML sections across 7 categories, each using CSS custom properties so palette swaps re-tone everything automatically:
 
 | Category | Variants |
 |---|---|
-| Navbar | brand-heavy-serif · sticky-transparent · centered-editorial |
-| Hero | centered-editorial · split-product-shot · bento-with-stats |
-| Features | alternating-rows · bento-varied · icon-triad |
-| Testimonials | three-card-grid · hero-quote |
-| Pricing | three-tier · single-plan |
-| CTA | centered-band · split-with-form |
-| Footer | minimal-hairline · giant-wordmark |
+| Navbar | Brand-heavy serif · Sticky transparent · Centered editorial |
+| Hero | Centered editorial · Split product shot · Bento with stats |
+| Features | Alternating rows · Bento varied · Icon triad |
+| Testimonials | Three-card grid · Hero quote |
+| Pricing | Three-tier · Single plan |
+| CTA | Centered band · Split with form |
+| Footer | Minimal hairline · Giant wordmark |
 
-Each variant uses CSS custom properties (`var(--accent)`, `var(--paper)`, `var(--ink)`) so palette swaps re-tone the whole section without touching HTML. All variants have responsive breakpoints.
+**12 themes** — editorial warm cream, saas minimal white, dark refined, corporate blue, luxury fashion, brutalist mono, cyber neon, and more.
 
-**10 palettes** (`src/ai/palettes.md`) — warm-cream-brick, minimal-white, dark-refined, corporate-blue, warm-earth, clinical-teal, fashion-mono, cyber-neon, sunset-terracotta, forest-paper.
-
-**12 themes** (`src/ai/themes.md`) — each bundles a palette, font pairing, radius scale, and motion vocabulary. Examples: `editorial-warm-cream`, `saas-corporate-blue`, `luxury-fashion`, `brutalist-mono`, `cyber-neon-dark`.
+**10 palettes** — each a set of CSS custom properties that layer on top of any theme.
 
 ---
 
-## Where your work is saved
+## Token cost
+
+| Action | Cost |
+|---|---|
+| Generate from kit | ~500 output tokens (copy-fill only) |
+| Swap a section | **0 tokens** |
+| Refine via chat | ~2k tokens |
+| Full freeform generation | ~10k tokens |
+
+---
+
+## Projects are saved automatically
 
 ```
 ~/Documents/lucid-design/
-├── my-app.html           ← current design HTML
-├── my-app.name           ← display name
-├── my-app.chat.json      ← full chat log, restored on reopen
+├── my-app.html        ← the design, autosaved on every change
+├── my-app.chat.json   ← full conversation, restored on reopen
 └── ...
 ```
 
-Every canvas edit, section swap, and refine autosaves. Reopen a project and the full conversation comes back.
-
-Exported designs go to `~/Documents/lucid-design/design-export-<timestamp>.html`.
-
 ---
 
-## Project structure
+## Contributing
 
-```
-src/
-├── main.rs               # entry: config, mac menu, wry webview, event loop
-├── config.rs             # config.toml parsing
-├── pipeline.rs           # IPC routing, assembly, swap, refine, critique
-├── variants.rs           # library parser (OnceLock<Library>)
-├── projects.rs           # ~/Documents/lucid-design/ file I/O
-├── knowledge.rs          # saved design patterns
-├── scraper/              # reference URL fetcher
-└── ai/
-    ├── mod.rs            # AiProvider trait
-    ├── prompts.rs        # system prompt + prompt builders
-    ├── anthropic.rs      # Anthropic API with cache_control
-    ├── openai.rs         # OpenAI-compatible (Groq / Mistral / Together / Ollama)
-    ├── gemini.rs
-    ├── claudecode.rs     # local Claude Code CLI subprocess
-    ├── design_knowledge.md   # 14 sections of UI/UX doctrine (~14k tokens)
-    ├── variants.md           # 17 hand-authored HTML fragments
-    ├── palettes.md           # 10 palette :root blocks
-    └── themes.md             # 12 theme kits
-assets/
-└── ui.html               # single-file frontend (HTML + CSS + JS, no build step)
-```
+Add a new variant by appending a block to `src/ai/variants.md` and adding it to `KIT_VARIANTS` in `src/assets/ui.html`. Rebuild and it's live.
 
----
-
-## Dependencies
-
-```
-wry 0.55 · tao 0.35 · tokio 1 · reqwest 0.12 · serde_json 1 · scraper 0.20 · anyhow 1
-[macOS] cocoa 0.25 · objc 0.2
+```bash
+git clone https://github.com/ankush109/lucid-design
+cd lucid-design
+cargo run
 ```
 
 ---
