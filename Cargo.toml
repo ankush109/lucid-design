@@ -1,6 +1,6 @@
 [package]
 name = "lucid-design"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Ankush Banerjee <banerjeeankush184@gmail.com>"]
 description = "Native macOS design generator — pick sections from a hand-authored variant library, LLM fills copy, swap sections zero-cost."

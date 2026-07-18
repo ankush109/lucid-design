@@ -2114,21 +2114,24 @@
         return;
       }
 
-      // If the idea is clearly a non-landing-page UI (dashboard, app, portfolio,
-      // admin panel, etc.) skip the kit picker — those sections are all marketing
-      // landing page pieces and would produce the wrong output. Go straight to
-      // freeform generation which can produce any UI type.
-      const nonLandingPagePattern = /\b(dashboard|admin|panel|portal|app ui|interface|editor|workspace|console|analytics|tracker|monitor|feed|inbox|calendar|kanban|board|timeline|profile|portfolio|gallery|directory|map|explorer|settings|onboarding|wizard|checkout|cart|player|reader|viewer|chat|messaging|crm|erp|internal tool|reporting|metrics|stats widget)\b/i;
-      if (nonLandingPagePattern.test(text)) {
-        setProcessing(true);
-        setStatus('busy', 'Designing…');
-        startDesign(text, 'auto');
+      // The kit picker is opt-in for LANDING PAGES only — its variant library
+      // (hero/features/pricing/CTA) is marketing-only and would produce the
+      // wrong output for dashboards, app UIs, portfolios, etc. Show the kit
+      // ONLY when the user explicitly asks for a landing/marketing page. All
+      // other ideas route to freeform generation which can produce any UI type
+      // (guided by §15 dashboards + §14 section anatomies in the knowledge base).
+      const landingPagePattern = /\b(landing page|landing|marketing site|marketing page|homepage|home page|saas site|product page|launch page|hero page|sales page|splash page|coming soon|waitlist page)\b/i;
+      if (landingPagePattern.test(text)) {
+        pendingIdea = text;
+        appendKitPicker(text);
         return;
       }
 
-      // Otherwise show the kit picker — best for landing pages and marketing sites.
-      pendingIdea = text;
-      appendKitPicker(text);
+      // Everything else → freeform. Dashboards, admin panels, portfolios,
+      // any product UI. Typos ("dashbard", "anlytics") still route here.
+      setProcessing(true);
+      setStatus('busy', 'Designing…');
+      startDesign(text, 'auto');
       return;
     }
     // No-op if text is empty and none of the above applied.
