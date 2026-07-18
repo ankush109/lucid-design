@@ -50,6 +50,6 @@ impl KnowledgeBase {
 
     fn path() -> PathBuf {
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-            .join(".config").join("design-gen").join("knowledge.json")
+            .join(".config").join("lucid-design").join("knowledge.json")
     }
 }

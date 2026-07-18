@@ -14,7 +14,7 @@ pub struct Project {
 
 pub fn dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    let d = PathBuf::from(home).join("Documents").join("design-gen");
+    let d = PathBuf::from(home).join("Documents").join("lucid-design");
     if !d.exists() {
         fs::create_dir_all(&d).context("create projects dir")?;
     }

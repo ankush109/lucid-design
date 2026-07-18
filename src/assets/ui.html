@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Design Generator</title>
+<title>Lucid Design</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -960,7 +960,7 @@
       <span class="count" id="rail-count">—</span>
     </div>
     <div class="rail-list" id="rail-list">
-      <div class="rail-empty">No projects yet. Start one below — it saves to <span class="mono" style="font-size:11px">~/Documents/design-gen/</span>.</div>
+      <div class="rail-empty">No projects yet. Start one below — it saves to <span class="mono" style="font-size:11px">~/Documents/lucid-design/</span>.</div>
     </div>
     <button class="rail-new" onclick="createProject()">
       <span>+ New project</span>
@@ -1210,7 +1210,7 @@
   <div class="modal" id="modal">
     <div class="m-eyebrow" id="modal-eyebrow">New project</div>
     <h3 class="serif" id="modal-title">Name this <em>project</em>.</h3>
-    <p id="modal-desc">A file will be created in <span class="mono">~/Documents/design-gen/</span>.</p>
+    <p id="modal-desc">A file will be created in <span class="mono">~/Documents/lucid-design/</span>.</p>
     <input id="modal-input" type="text" placeholder="Untitled" autocomplete="off" />
     <div class="modal-actions">
       <button class="modal-btn" onclick="closeModal(null)">Cancel</button>
@@ -1374,7 +1374,7 @@
   ];
 
   // ── Theme ──
-  const THEME_KEY = 'design-gen-theme';
+  const THEME_KEY = 'lucid-design-theme';
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
     document.getElementById('theme-icon-sun').style.display  = t === 'dark' ? 'none' : '';
@@ -1393,7 +1393,7 @@
   })();
 
   // ── Rail collapse ──
-  const RAIL_KEY = 'design-gen-rail';
+  const RAIL_KEY = 'lucid-design-rail';
   function applyRail(state) {
     document.documentElement.setAttribute('data-rail', state);
   }
@@ -2851,7 +2851,7 @@
     count.textContent = projectsList.length.toString().padStart(2, '0');
 
     if (projectsList.length === 0) {
-      list.innerHTML = '<div class="rail-empty">No projects yet. Start one below — it saves to <span class="mono" style="font-size:11px">~/Documents/design-gen/</span>.</div>';
+      list.innerHTML = '<div class="rail-empty">No projects yet. Start one below — it saves to <span class="mono" style="font-size:11px">~/Documents/lucid-design/</span>.</div>';
       return;
     }
 
@@ -2891,7 +2891,7 @@
     const name = await openModal({
       eyebrow: 'New project',
       title: 'Name this <em>project</em>.',
-      desc: 'A file will be created in <span class="mono">~/Documents/design-gen/</span>.',
+      desc: 'A file will be created in <span class="mono">~/Documents/lucid-design/</span>.',
       placeholder: 'Untitled',
       initial: '',
       okText: 'Create',
@@ -2910,7 +2910,7 @@
       mode: 'confirm',
       eyebrow: 'Delete project',
       title: 'Delete <em>' + esc(name) + '</em>?',
-      desc: 'This removes the file from <span class="mono">~/Documents/design-gen/</span>. Cannot be undone.',
+      desc: 'This removes the file from <span class="mono">~/Documents/lucid-design/</span>. Cannot be undone.',
       okText: 'Delete',
       danger: true,
     });

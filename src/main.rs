@@ -1,5 +1,5 @@
 #[cfg(not(target_os = "macos"))]
-compile_error!("design-gen only runs on macOS (requires WKWebView + Cocoa).");
+compile_error!("lucid-design only runs on macOS (requires WKWebView + Cocoa).");
 
 mod ai;
 mod config;
@@ -24,11 +24,11 @@ fn main() -> Result<()> {
     let cfg = match config::Config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("\n[design-gen] Configuration error:\n{}\n", e);
+            eprintln!("\n[lucid-design] Configuration error:\n{}\n", e);
             std::process::exit(1);
         }
     };
-    println!("[design-gen] provider={} model={}", cfg.provider, cfg.model);
+    println!("[lucid-design] provider={} model={}", cfg.provider, cfg.model);
 
     // Warm up the variant library so parse errors show at startup, not on
     // first design. Print counts so it's obvious the catalog loaded.
@@ -37,7 +37,7 @@ fn main() -> Result<()> {
         .map(|(k, v)| format!("{}:{}", k, v.len()))
         .collect();
     println!(
-        "[design-gen] library: {} variants ({}), {} palettes, {} themes",
+        "[lucid-design] library: {} variants ({}), {} palettes, {} themes",
         lib.variants.len(), cats.join(", "), lib.palettes.len(), lib.themes.len()
     );
 
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_title("Design Generator")
+        .with_title("Lucid Design")
         .with_inner_size(LogicalSize::new(1280.0_f64, 820.0_f64))
         .build(&event_loop)?;
 
@@ -183,7 +183,7 @@ fn install_mac_menu() {
         let app_item: cocoa::base::id = msg_send![class!(NSMenuItem), new];
         let app_menu: cocoa::base::id = msg_send![class!(NSMenu), new];
 
-        let quit_title = NSString::alloc(nil).init_str("Quit Design Generator");
+        let quit_title = NSString::alloc(nil).init_str("Quit Lucid Design");
         let quit_key   = NSString::alloc(nil).init_str("q");
         let quit_item: cocoa::base::id = msg_send![NSMenuItem::alloc(nil),
             initWithTitle: quit_title
@@ -242,8 +242,8 @@ description: Senior UI/UX design principles for building high-quality frontend i
     );
 
     match std::fs::write(&skill_file, &content) {
-        Ok(_)  => println!("[design-gen] frontend-design skill installed at {}", skill_file.display()),
-        Err(e) => eprintln!("[design-gen] could not install frontend-design skill: {}", e),
+        Ok(_)  => println!("[lucid-design] frontend-design skill installed at {}", skill_file.display()),
+        Err(e) => eprintln!("[lucid-design] could not install frontend-design skill: {}", e),
     }
 }
 

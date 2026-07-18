@@ -586,7 +586,7 @@ pub async fn capture_screenshot(url: &str) -> Option<std::path::PathBuf> {
     ];
     let chrome = candidates.iter().find(|p| std::path::Path::new(p).exists())?;
 
-    let temp_dir = std::env::temp_dir().join("design-gen-refs");
+    let temp_dir = std::env::temp_dir().join("lucid-design-refs");
     std::fs::create_dir_all(&temp_dir).ok()?;
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     let out_path = temp_dir.join(format!("ref-{}.png", ts));

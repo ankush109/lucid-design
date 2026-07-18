@@ -51,7 +51,7 @@ fn read_toml_key(key: &str) -> Result<String> {
     let content = fs::read_to_string("config.toml")
         .or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
-            fs::read_to_string(format!("{}/.config/design-gen/config.toml", home))
+            fs::read_to_string(format!("{}/.config/lucid-design/config.toml", home))
         })?;
 
     for line in content.lines() {
