@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use super::{AiProvider, Completion, Usage};
@@ -39,6 +39,10 @@ impl AiProvider for ClaudeCodeProvider {
         let user   = user.to_string();
 
         tokio::task::spawn_blocking(move || {
+            // Pipe the user prompt via stdin instead of as a CLI arg. The freeform
+            // generation path sends 60KB+ of combined SYSTEM_CONTEXT + refs + user
+            // prompt — as a positional arg that hangs the shell on macOS. Stdin
+            // handles arbitrary-sized input cleanly.
             let mut child = Command::new(&binary)
                 .arg("--print")
                 .arg("--output-format").arg("stream-json")
@@ -46,11 +50,18 @@ impl AiProvider for ClaudeCodeProvider {
                 .arg("--verbose")
                 .arg("--allowedTools").arg("none")
                 .arg("--system-prompt").arg(&system)
-                .arg(&user)
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()?;
 
+            // Write user prompt through stdin — no arg size limits.
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(user.as_bytes()).ok();
+                drop(stdin);
+            }
+
+            let stderr = child.stderr.take();
             let stdout = child.stdout.take().unwrap();
             let reader = BufReader::new(stdout);
 
@@ -105,7 +116,16 @@ impl AiProvider for ClaudeCodeProvider {
             child.wait().ok();
 
             if full_text.is_empty() {
-                return Err(anyhow!("claude returned empty output — is it logged in?"));
+                // Surface stderr so the user sees why claude failed instead of a
+                // generic "empty output" message (login expired, quota exhausted, etc).
+                let err_msg = stderr.and_then(|mut e| {
+                    use std::io::Read;
+                    let mut s = String::new();
+                    e.read_to_string(&mut s).ok().map(|_| s.trim().to_string())
+                }).filter(|s| !s.is_empty()).unwrap_or_else(||
+                    "claude returned empty output — is it logged in? (run `claude` in your terminal to check)".into()
+                );
+                return Err(anyhow!("{}", err_msg));
             }
             Ok(match usage {
                 Some(u) => Completion::with(full_text, u),

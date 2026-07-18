@@ -503,8 +503,16 @@ async fn handle_start_design(
         }
     } else { String::new() };
 
-    let _ = tx.send(AppEvent::StatusUpdate("Scraping design references...".into()));
-    let refs = scraper::gather(idea).await;
+    // Skip web scraping unless the user explicitly pasted a reference URL. For
+    // non-landing-page ideas (dashboards, portfolios, admin panels) awwwards
+    // results are irrelevant and bias the LLM toward marketing sites, plus the
+    // extra scraper output pushes the CLI prompt into slow/hang territory.
+    let refs = if user_ref_block.is_empty() {
+        String::new()
+    } else {
+        let _ = tx.send(AppEvent::StatusUpdate("Scraping design references...".into()));
+        scraper::gather(idea).await
+    };
     let _ = tx.send(AppEvent::StatusUpdate(
         if tried.is_empty() { "Designing…".into() } else { "Redesigning with a different layout…".into() }
     ));
