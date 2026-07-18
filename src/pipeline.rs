@@ -503,15 +503,17 @@ async fn handle_start_design(
         }
     } else { String::new() };
 
-    // Skip web scraping unless the user explicitly pasted a reference URL. For
-    // non-landing-page ideas (dashboards, portfolios, admin panels) awwwards
-    // results are irrelevant and bias the LLM toward marketing sites, plus the
-    // extra scraper output pushes the CLI prompt into slow/hang territory.
-    let refs = if user_ref_block.is_empty() {
-        String::new()
-    } else {
-        let _ = tx.send(AppEvent::StatusUpdate("Scraping design references...".into()));
-        scraper::gather(idea).await
+    // Scrape design references (Awwwards, SiteInspire) with a hard 8s timeout
+    // so a slow external site can't block the whole design flow. If it fails or
+    // times out we proceed with an empty refs block — the design knowledge base
+    // in SYSTEM_CONTEXT is enough to produce a good design on its own.
+    let _ = tx.send(AppEvent::StatusUpdate("Scraping design references...".into()));
+    let refs = match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        scraper::gather(idea),
+    ).await {
+        Ok(s) => s,
+        Err(_) => String::new(),
     };
     let _ = tx.send(AppEvent::StatusUpdate(
         if tried.is_empty() { "Designing…".into() } else { "Redesigning with a different layout…".into() }
