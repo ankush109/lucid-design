@@ -33,6 +33,11 @@ pub enum AppEvent {
     /// does NOT touch history, state, or the "ready" pill.
     AssemblyPreview(String),
     CritiqueFixes(String), // JSON array [{label, prompt}]
+    /// Multi-page manifest sent to UI to build the tab bar.
+    PagesList { pages: String, active: String }, // pages is JSON
+    /// After a design lands, suggest sub-pages the user could design next
+    /// based on unwired nav links in the just-generated HTML.
+    PageSuggestions { candidates: String }, // JSON: [{slug, name}]
     TokenUsage {
         turn_input:     u32,
         turn_output:    u32,
@@ -63,6 +68,7 @@ pub async fn run(
     let mut state           = State::AwaitingIdea;
     let mut knowledge       = KnowledgeBase::load();
     let mut current_project: Option<String> = None;
+    let mut current_page:    String = "home".into();
     let mut session_input:  u64 = 0;
     let mut session_output: u64 = 0;
 
@@ -84,6 +90,7 @@ pub async fn run(
                 match projects::create(msg.content.trim()) {
                     Ok(p) => {
                         current_project = Some(p.slug.clone());
+                        current_page = "home".into();
                         state = State::AwaitingIdea;
                         let _ = tx.send(AppEvent::ProjectOpened {
                             slug: p.slug.clone(),
@@ -92,6 +99,7 @@ pub async fn run(
                             chat: "[]".into(),
                         });
                         push_projects_list(&tx);
+                        push_pages(&tx, &p.slug);
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::AssistantMessage(
@@ -104,7 +112,14 @@ pub async fn run(
 
             "open_project" => {
                 let slug = msg.content.trim().to_string();
-                match projects::read(&slug) {
+                let manifest = projects::read_pages_manifest(&slug).unwrap_or_default();
+                current_page = manifest.active.clone();
+                let read_result = if current_page == "home" {
+                    projects::read(&slug)
+                } else {
+                    projects::read_page(&slug, &current_page)
+                };
+                match read_result {
                     Ok(html) => {
                         current_project = Some(slug.clone());
                         let name = projects::name_of(&slug).unwrap_or_default();
@@ -119,7 +134,8 @@ pub async fn run(
                         } else {
                             state = State::AwaitingIdea;
                         }
-                        let _ = tx.send(AppEvent::ProjectOpened { slug, name, html, chat });
+                        let _ = tx.send(AppEvent::ProjectOpened { slug: slug.clone(), name, html, chat });
+                        push_pages(&tx, &slug);
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::AssistantMessage(
@@ -133,6 +149,122 @@ pub async fn run(
             "save_chat" => {
                 if let Some(ref slug) = current_project {
                     let _ = projects::write_chat(slug, &msg.content);
+                }
+                continue;
+            }
+
+            "list_pages" => {
+                if let Some(ref slug) = current_project { push_pages(&tx, slug); }
+                continue;
+            }
+
+            "switch_page" => {
+                let target = msg.content.trim().to_string();
+                let slug = match &current_project { Some(s) => s.clone(), None => continue };
+                let manifest = projects::read_pages_manifest(&slug).unwrap_or_default();
+                if !manifest.pages.iter().any(|p| p.slug == target) { continue; }
+
+                // Save the current page's HTML before switching.
+                persist_current(&current_project, &current_page, &state, &tx);
+
+                current_page = target.clone();
+                let _ = projects::set_active_page(&slug, &target);
+
+                let html = if target == "home" {
+                    projects::read(&slug).unwrap_or_default()
+                } else {
+                    projects::read_page(&slug, &target).unwrap_or_default()
+                };
+                state = if html.trim().is_empty() {
+                    State::AwaitingIdea
+                } else {
+                    State::Refining {
+                        current: html.clone(),
+                        idea:    projects::name_of(&slug).unwrap_or_default(),
+                        theme:   String::new(),
+                        tried_archetypes: Vec::new(),
+                    }
+                };
+                let _ = tx.send(AppEvent::DesignUpdate(html));
+                push_pages(&tx, &slug);
+                continue;
+            }
+
+            "delete_page" => {
+                let target = msg.content.trim().to_string();
+                let slug = match &current_project { Some(s) => s.clone(), None => continue };
+                let _ = projects::delete_page(&slug, &target);
+                if current_page == target { current_page = "home".into(); }
+                push_pages(&tx, &slug);
+                // Reload the (now active) home page into the canvas.
+                let html = projects::read(&slug).unwrap_or_default();
+                let _ = tx.send(AppEvent::DesignUpdate(html));
+                continue;
+            }
+
+            "create_page" => {
+                let payload: serde_json::Value = serde_json::from_str(&msg.content)
+                    .unwrap_or(serde_json::Value::Null);
+                let name = payload["name"].as_str().unwrap_or("").trim().to_string();
+                let brief = payload["brief"].as_str().unwrap_or("").trim().to_string();
+                let slug = match &current_project { Some(s) => s.clone(), None => continue };
+                if name.is_empty() { continue; }
+
+                // Load home page HTML — it's the shell donor.
+                let home_html = projects::read(&slug).unwrap_or_default();
+                if home_html.trim().is_empty() {
+                    let _ = tx.send(AppEvent::AssistantMessage(
+                        "Design the Home page first — new pages inherit its shell.".into()
+                    ));
+                    continue;
+                }
+
+                // Reserve the page slot in the manifest and make it active.
+                let page_slug = match projects::add_page(&slug, &name) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::AssistantMessage(format!("Couldn't add page: {}", e)));
+                        continue;
+                    }
+                };
+                current_page = page_slug.clone();
+                push_pages(&tx, &slug);
+
+                let project_name = projects::name_of(&slug).unwrap_or_default();
+                stop_flag.store(false, Ordering::SeqCst);
+                let _ = tx.send(AppEvent::SetGenerating(true));
+                let _ = tx.send(AppEvent::StatusUpdate(
+                    format!("Designing the {} page…", name)
+                ));
+
+                let result = handle_new_page(
+                    &project_name, &name, &brief, &home_html,
+                    &provider, &tx, stop_flag.clone(),
+                ).await;
+
+                let _ = tx.send(AppEvent::SetGenerating(false));
+
+                match result {
+                    Ok((html, usage)) => {
+                        state = State::Refining {
+                            current: html.clone(),
+                            idea:    project_name.clone(),
+                            theme:   String::new(),
+                            tried_archetypes: Vec::new(),
+                        };
+                        emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        persist_current(&current_project, &current_page, &state, &tx);
+                        let _ = tx.send(AppEvent::DesignUpdate(html));
+                        let _ = tx.send(AppEvent::AssistantMessage(
+                            format!("Ready — {} page designed. Switch pages from the tabs above the canvas.", name)
+                        ));
+                    }
+                    Err(e) if e.to_string() == "__stopped__" => {}
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::AssistantMessage(
+                            format!("Couldn't design the {} page: {}", name, e)
+                        ));
+                    }
                 }
                 continue;
             }
@@ -169,7 +301,15 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
-                        persist_current(&current_project, &state, &tx);
+                        persist_current(&current_project, &current_page, &state, &tx);
+                        // On the home page of a project, suggest linked sub-pages
+                        // the user could design next based on the generated nav.
+                        if current_page == "home" {
+                            if let (Some(slug), State::Refining { current, .. }) = (current_project.as_ref(), &state) {
+                                push_pages(&tx, slug);
+                                push_page_suggestions(&tx, slug, current);
+                            }
+                        }
                         if let State::Refining { current, .. } = &state {
                             spawn_critique(current.clone(), provider.clone(), tx.clone());
                         }
@@ -216,7 +356,13 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
-                        persist_current(&current_project, &state, &tx);
+                        persist_current(&current_project, &current_page, &state, &tx);
+                        if current_page == "home" {
+                            if let (Some(slug), State::Refining { current, .. }) = (current_project.as_ref(), &state) {
+                                push_pages(&tx, slug);
+                                push_page_suggestions(&tx, slug, current);
+                            }
+                        }
                     }
                     Err(e) if e.to_string() == "__stopped__" => {}
                     Err(e) => {
@@ -251,7 +397,7 @@ pub async fn run(
                         let _ = tx.send(AppEvent::AssistantMessage(
                             format!("Swapped to {}.", variant_id)
                         ));
-                        persist_current(&current_project, &state, &tx);
+                        persist_current(&current_project, &current_page, &state, &tx);
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::AssistantMessage(
@@ -282,7 +428,7 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
-                        persist_current(&current_project, &state, &tx);
+                        persist_current(&current_project, &current_page, &state, &tx);
                         if let State::Refining { current, .. } = &state {
                             spawn_critique(current.clone(), provider.clone(), tx.clone());
                         }
@@ -324,7 +470,7 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
-                        persist_current(&current_project, &state, &tx);
+                        persist_current(&current_project, &current_page, &state, &tx);
                     }
                     Err(e) if e.to_string() == "__stopped__" => {}
                     Err(e) => {
@@ -402,7 +548,7 @@ pub async fn run(
             Ok((next, usage)) => {
                 state = next;
                 emit_usage(&tx, usage, &mut session_input, &mut session_output);
-                persist_current(&current_project, &state, &tx);
+                persist_current(&current_project, &current_page, &state, &tx);
             }
             Err(e) if e.to_string() == "__stopped__" => {}
             Err(e) => {
@@ -429,11 +575,115 @@ fn emit_usage(
     });
 }
 
-fn persist_current(current_project: &Option<String>, state: &State, tx: &Sender<AppEvent>) {
+/// Design a sub-page of an existing project. The home page's HTML is the
+/// "shell donor" — the nav / sidebar / topbar / theme must survive unchanged.
+/// Only the main workspace changes to be the {page_name} content.
+async fn handle_new_page(
+    project_name: &str,
+    page_name:    &str,
+    user_brief:   &str,
+    home_html:    &str,
+    provider:     &Provider,
+    tx:           &Sender<AppEvent>,
+    stop:         Arc<AtomicBool>,
+) -> Result<(String, ai::Usage)> {
+    let bounded_home = bound_html(home_html, 30_000);
+
+    let system = "You are a senior UI/UX designer designing an additional page \
+of a multi-page product UI. You will receive the HOME page's HTML as reference. \
+Your output is a NEW page that lives in the same project.\n\n\
+HARD RULES:\n\
+- Keep the app shell IDENTICAL to the home page: <head>, <style>, all CSS \
+custom properties (--paper, --ink, --accent, etc.), the sidebar/topbar/nav HTML, \
+and the fonts. The user must feel they never left the app.\n\
+- Update the active nav item so the {NEW_PAGE_NAME} item is marked active \
+(add class=\"active\" or aria-current=\"page\") and the home item is not.\n\
+- Only change the MAIN WORKSPACE (the primary content area — everything that \
+isn't the sidebar/topbar/nav/footer).\n\
+- Realistic domain content specific to the page's purpose (settings → account/notifications/integrations/billing; users → list + filters + detail drawer; reports → chart + table; etc).\n\
+- Real inline data — never Lorem Ipsum, never round-number stats.\n\
+- Output the FULL HTML document. Not a diff. Not a fragment. Not markdown fences.\n\
+- Every nav link continues to point to real filenames (`./home.html`, `./{other-pages}.html`).\n\n\
+Output ONLY raw HTML.";
+
+    let user = format!(
+        "Project: {project_name}\n\
+New page to design: {page_name}\n\
+{brief_line}\n\n\
+=== HOME PAGE HTML (shell donor — reuse its head, styles, and nav exactly) ===\n\
+{bounded_home}\n\n\
+Now output the complete HTML for the {page_name} page. Same shell, new workspace.",
+        brief_line = if user_brief.is_empty() { String::new() } else { format!("Brief: {user_brief}") },
+    );
+
+    let comp = stream_generate(provider, system, &user, 8000, tx, stop).await?;
+    let usage = usage_or_estimate(comp.usage, system, &user, &comp.text);
+    Ok((comp.text, usage))
+}
+
+fn persist_current(
+    current_project: &Option<String>,
+    current_page:    &str,
+    state:           &State,
+    tx:              &Sender<AppEvent>,
+) {
     if let (Some(slug), State::Refining { current, .. }) = (current_project.as_ref(), state) {
-        let _ = projects::write(slug, current);
+        // Write to the active page's file. Falls back to legacy write() for the
+        // home page so existing single-file projects keep working.
+        if current_page == "home" {
+            let _ = projects::write(slug, current);
+        } else {
+            let _ = projects::write_page(slug, current_page, current);
+        }
         push_projects_list(tx);
     }
+}
+
+/// After a design lands, scan the HTML for `<a href="./XXX.html">LABEL</a>`
+/// links, cross-reference against the project's page manifest, and return the
+/// pages that are linked but don't exist yet. UI shows these as "Design next?"
+/// chips.
+fn suggest_next_pages(html: &str, project_slug: &str) -> Vec<(String, String)> {
+    use regex::Regex;
+    let re = Regex::new(r#"<a[^>]+href=["']\.?/?([a-zA-Z0-9-_]+)\.html["'][^>]*>([^<]{1,60})</a>"#)
+        .unwrap();
+
+    let manifest = projects::read_pages_manifest(project_slug).unwrap_or_default();
+    let existing: std::collections::HashSet<String> =
+        manifest.pages.iter().map(|p| p.slug.clone()).collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out  = Vec::new();
+
+    for cap in re.captures_iter(html) {
+        let raw_slug  = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let raw_label = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        if raw_slug.is_empty() || raw_label.is_empty() { continue; }
+        let slug = projects::slugify(raw_slug);
+        if slug == "home" || slug == "index" { continue; }
+        if existing.contains(&slug) { continue; }
+        if !seen.insert(slug.clone()) { continue; }
+        out.push((slug, raw_label.into()));
+        if out.len() >= 6 { break; }
+    }
+    out
+}
+
+fn push_pages(tx: &Sender<AppEvent>, project_slug: &str) {
+    let manifest = projects::read_pages_manifest(project_slug).unwrap_or_default();
+    let json = serde_json::to_string(&manifest.pages).unwrap_or_else(|_| "[]".into());
+    let _ = tx.send(AppEvent::PagesList { pages: json, active: manifest.active });
+}
+
+fn push_page_suggestions(tx: &Sender<AppEvent>, project_slug: &str, html: &str) {
+    let candidates = suggest_next_pages(html, project_slug);
+    if candidates.is_empty() { return; }
+    let json: String = serde_json::to_string(
+        &candidates.iter()
+            .map(|(slug, name)| serde_json::json!({ "slug": slug, "name": name }))
+            .collect::<Vec<_>>()
+    ).unwrap_or_else(|_| "[]".into());
+    let _ = tx.send(AppEvent::PageSuggestions { candidates: json });
 }
 
 fn push_projects_list(tx: &Sender<AppEvent>) {

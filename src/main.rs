@@ -142,6 +142,16 @@ fn main() -> Result<()> {
                         .unwrap_or_else(|_| serde_json::json!([]));
                     serde_json::json!({"type":"critique","items":value})
                 }
+                pipeline::AppEvent::PagesList { pages, active } => {
+                    let value: serde_json::Value = serde_json::from_str(pages)
+                        .unwrap_or_else(|_| serde_json::json!([]));
+                    serde_json::json!({"type":"pages","pages":value,"active":active})
+                }
+                pipeline::AppEvent::PageSuggestions { candidates } => {
+                    let value: serde_json::Value = serde_json::from_str(candidates)
+                        .unwrap_or_else(|_| serde_json::json!([]));
+                    serde_json::json!({"type":"page_suggestions","candidates":value})
+                }
                 pipeline::AppEvent::TokenUsage {
                     turn_input, turn_output,
                     session_input, session_output, estimated,

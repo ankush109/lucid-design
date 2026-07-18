@@ -562,6 +562,36 @@
   }
   .target-chip .clear:hover { opacity: 1; }
 
+  /* ── Page tabs (multi-page projects) ── */
+  .page-tabs {
+    display: flex; align-items: flex-end; gap: 2px;
+    padding: 0 18px; padding-top: 6px;
+    background: var(--preview-bg);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+  }
+  .page-tabs-inner { display: flex; gap: 2px; }
+  .page-tab {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px; letter-spacing: 0.02em;
+    background: transparent; color: var(--muted);
+    border: 1px solid transparent; border-bottom: none;
+    padding: 6px 12px; border-radius: 4px 4px 0 0;
+    cursor: pointer; transition: background 120ms ease, color 120ms ease;
+  }
+  .page-tab:hover { color: var(--ink-2); background: color-mix(in oklab, var(--ink) 4%, transparent); }
+  .page-tab.active {
+    color: var(--ink); background: var(--paper);
+    border-color: var(--border);
+    box-shadow: 0 1px 0 var(--paper);
+  }
+  .page-tab-new {
+    color: var(--accent); font-weight: 500;
+    background: transparent; border: 1px dashed var(--border); border-bottom: none;
+    margin-left: 4px;
+  }
+  .page-tab-new:hover { background: color-mix(in oklab, var(--accent) 8%, transparent); }
+
   /* ── Preview area ── */
   .preview-area {
     flex: 1; overflow: hidden;
@@ -1044,6 +1074,11 @@
       <button class="tb-btn" id="export-btn" onclick="exportHTML()" style="display:none">↓ Export HTML</button>
     </div>
 
+    <div class="page-tabs" id="page-tabs" style="display:none">
+      <div class="page-tabs-inner" id="page-tabs-inner"></div>
+      <button class="page-tab page-tab-new" id="page-tab-new" onclick="promptNewPage()" title="Design a new page in this project">+ page</button>
+    </div>
+
     <div class="preview-area" id="preview-area">
       <div class="empty-state" id="empty-state">
         <div class="empty-mark">✦</div>
@@ -1477,8 +1512,106 @@
       case 'tokens':         onTokens(msg); break;
       case 'critique':       onCritique(msg.items); break;
       case 'assembly_preview': onAssemblyPreview(msg.content); break;
+      case 'pages':            onPages(msg.pages, msg.active); break;
+      case 'page_suggestions': onPageSuggestions(msg.candidates); break;
     }
   };
+
+  // ── Multi-page project support ──
+  let currentPages = [];
+  let currentActivePage = 'home';
+
+  function onPages(pages, active) {
+    currentPages = Array.isArray(pages) ? pages : [];
+    currentActivePage = active || 'home';
+    renderPageTabs();
+  }
+
+  function renderPageTabs() {
+    const wrap  = document.getElementById('page-tabs');
+    const inner = document.getElementById('page-tabs-inner');
+    if (!wrap || !inner) return;
+
+    // Hide the tab bar unless the project actually has multiple pages OR the
+    // home page has landed (so + page is a meaningful action).
+    if (currentPages.length === 0 || !currentHTML) {
+      wrap.style.display = 'none';
+      return;
+    }
+    wrap.style.display = '';
+
+    inner.innerHTML = currentPages.map(p => {
+      const active = p.slug === currentActivePage ? ' active' : '';
+      return '<button class="page-tab' + active + '" data-page-slug="' + esc(p.slug) + '">' + esc(p.name) + '</button>';
+    }).join('');
+
+    inner.querySelectorAll('.page-tab').forEach(btn => {
+      btn.addEventListener('click', function(e) {
+        e.preventDefault();
+        const slug = btn.dataset.pageSlug;
+        if (!slug || slug === currentActivePage) return;
+        if (isProcessing) return;
+        setStatus('busy', 'Switching page…');
+        ipcSend('switch_page', slug);
+      });
+    });
+  }
+
+  function onPageSuggestions(candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return;
+    const msgs = document.getElementById('messages');
+    if (!msgs) return;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'msg assistant';
+    const chips = candidates.map(c =>
+      '<button class="theme-chip page-suggest-chip" data-page-name="' + esc(c.name) + '">' + esc(c.name) + '</button>'
+    ).join('');
+    wrap.innerHTML =
+      '<span class="msg-label">Assistant</span>' +
+      '<div class="bubble">Your design links to <strong>' + candidates.length +
+      '</strong> other page' + (candidates.length === 1 ? '' : 's') +
+      '. Design one next? The shell (nav, sidebar, theme) will carry over automatically.' +
+      '<div class="theme-picker" style="margin-top:12px">' + chips +
+      '</div></div>';
+    msgs.appendChild(wrap);
+    msgs.scrollTop = msgs.scrollHeight;
+
+    wrap.querySelectorAll('.page-suggest-chip').forEach(btn => {
+      btn.addEventListener('click', function(e) {
+        e.preventDefault();
+        if (isProcessing) return;
+        const name = btn.dataset.pageName;
+        if (!name) return;
+        wrap.querySelectorAll('.page-suggest-chip').forEach(c => c.disabled = true);
+        appendMsg('user', 'You', 'Design the ' + name + ' page');
+        setProcessing(true);
+        setStatus('busy', 'Designing ' + name + '…');
+        ipcSend('create_page', JSON.stringify({ name: name, brief: '' }));
+      });
+    });
+  }
+
+  async function promptNewPage() {
+    if (isProcessing) return;
+    if (!currentHTML) {
+      appendMsg('assistant', 'Assistant', 'Design the Home page first — new pages inherit its shell.');
+      return;
+    }
+    const name = await openModal({
+      eyebrow: 'New page',
+      title:   'Design a <em>new page</em>.',
+      desc:    'The nav, sidebar, and theme carry over from the home page.',
+      placeholder: 'Settings',
+      okText:  'Design page',
+    });
+    if (!name) return;
+    appendMsg('user', 'You', 'Design the ' + name + ' page');
+    setProcessing(true);
+    setStatus('busy', 'Designing ' + name + '…');
+    ipcSend('create_page', JSON.stringify({ name: name, brief: '' }));
+  }
+  window.promptNewPage = promptNewPage;
 
   // Interim preview during progressive assembly — updates the iframe, does
   // NOT touch currentHTML, history, or the ready pill. The final DesignUpdate
@@ -2348,6 +2481,8 @@
     document.getElementById('proto-btn').style.display = '';
     document.getElementById('export-btn').style.display = '';
     setStatus('ready', 'Ready');
+    // Now that a design exists, the page tabs are meaningful — show/refresh.
+    renderPageTabs();
   }
 
   function showPreview(html) {
@@ -2977,6 +3112,10 @@
       appendMsg('assistant', 'Assistant', 'Started ' + msg.name + '. Describe what you\'re designing — mention layout style and palette if you have preferences.');
     }
     setStatus('ready', 'Ready');
+    // Reset multi-page state — Rust will follow up with a `pages` event.
+    currentPages = [];
+    currentActivePage = 'home';
+    document.getElementById('page-tabs').style.display = 'none';
   }
 
   function setCrumb(text) {
