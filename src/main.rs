@@ -248,11 +248,16 @@ description: Senior UI/UX design principles for building high-quality frontend i
 }
 
 fn save_file(prefix: &str, html: &str) -> Result<String> {
+    let dir = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| ".".into())
+    ).join("Documents").join("lucid-design");
+    std::fs::create_dir_all(&dir)?;
     let name = format!(
         "{}-{}.html",
         prefix,
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()
     );
-    std::fs::write(&name, html)?;
-    Ok(name)
+    let path = dir.join(&name);
+    std::fs::write(&path, html)?;
+    Ok(path.display().to_string())
 }
