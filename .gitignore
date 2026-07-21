@@ -2,6 +2,7 @@
 design-export-*.html
 design-prototype-*.html
 frontend/node_modules/
-frontend/dist/
+frontend/dist/*
+!frontend/dist/index.html
 frontend/.vite/
 frontend/*.log
