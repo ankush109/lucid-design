@@ -1,21 +1,56 @@
 use anyhow::{Result, anyhow};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use super::{AiProvider, Completion, Usage};
 
 pub struct ClaudeCodeProvider {
     binary: String,
+    // Filled the first time we see a `system:init` or `assistant.message`
+    // event in the stream — that's when Claude Code discloses its model.
+    detected_model: Arc<Mutex<Option<String>>>,
 }
 
 impl ClaudeCodeProvider {
     pub fn new() -> Self {
-        let binary = if std::path::Path::new("/usr/local/bin/claude").exists() {
-            "/usr/local/bin/claude".into()
-        } else {
-            "claude".into()
-        };
-        Self { binary }
+        // Warm the detected-model slot from a persisted cache so the badge
+        // shows the real model at startup instead of "…" until the first
+        // LLM call. Cache is refreshed after each successful stream.
+        let cached = std::fs::read_to_string(Self::cache_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let detected_model = Arc::new(Mutex::new(cached));
+
+        let candidates = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+        ];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return Self { binary: c.into(), detected_model };
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let p = std::path::PathBuf::from(&home).join(".local/bin/claude");
+            if p.exists() {
+                return Self { binary: p.to_string_lossy().into_owned(), detected_model };
+            }
+        }
+        Self { binary: "claude".into(), detected_model }
+    }
+
+    fn cache_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+            .join(".config").join("lucid-design").join("claudecode.model")
+    }
+
+    fn persist_model(model: &str) {
+        let path = Self::cache_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, model);
     }
 }
 
@@ -24,6 +59,10 @@ impl AiProvider for ClaudeCodeProvider {
     async fn complete(&self, system: &str, user: &str, max_tokens: u32) -> Result<Completion> {
         let stop = Arc::new(AtomicBool::new(false));
         self.complete_streaming(system, user, max_tokens, Box::new(|_| {}), stop).await
+    }
+
+    fn detected_model(&self) -> Option<String> {
+        self.detected_model.lock().ok().and_then(|g| g.clone())
     }
 
     async fn complete_streaming(
@@ -37,6 +76,7 @@ impl AiProvider for ClaudeCodeProvider {
         let binary = self.binary.clone();
         let system = system.to_string();
         let user   = user.to_string();
+        let detected_model = self.detected_model.clone();
 
         tokio::task::spawn_blocking(move || {
             // Pipe the user prompt via stdin instead of as a CLI arg. The freeform
@@ -82,6 +122,21 @@ impl AiProvider for ClaudeCodeProvider {
                 if line.is_empty() { continue; }
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    // Sniff the model out of any event that discloses it.
+                    // `system:init` fires first with `.model`; assistant
+                    // messages carry `.message.model`. Either works.
+                    let model_hit = json["model"].as_str()
+                        .or_else(|| json["message"]["model"].as_str());
+                    if let Some(m) = model_hit {
+                        if !m.is_empty() {
+                            let mut slot = detected_model.lock().unwrap();
+                            if slot.as_deref() != Some(m) {
+                                *slot = Some(m.to_string());
+                                ClaudeCodeProvider::persist_model(m);
+                            }
+                        }
+                    }
+
                     match json["type"].as_str().unwrap_or("") {
                         "stream_event" => {
                             let ev = &json["event"];

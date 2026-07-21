@@ -73,6 +73,10 @@ fn default_model(provider: &str) -> String {
         "mistral"              => "mistral-large-latest".into(),
         "gemini"               => "gemini-1.5-pro".into(),
         "ollama"               => "llama3".into(),
-        _                      => "gpt-4o".into(),
+        // claudecode / codex CLI providers pick their own model — we detect
+        // it from the streaming output rather than defaulting.
+        "claudecode" | "claude-code" => "…".into(),
+        "codex"                      => "…".into(),
+        _ => "…".into(),
     }
 }

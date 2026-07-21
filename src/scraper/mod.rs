@@ -31,6 +31,19 @@ fn build_client() -> Client {
 }
 
 pub async fn gather(idea: &str) -> String {
+    let refs = gather_refs(idea).await;
+    if refs.is_empty() {
+        let keyword = idea.split_whitespace().take(3).collect::<Vec<_>>().join("+");
+        format!("No live references scraped for '{}'. Use your design knowledge.", keyword)
+    } else {
+        refs.iter().map(|r| r.summary()).collect::<Vec<_>>().join("\n\n")
+    }
+}
+
+/// Same as `gather` but returns the structured DesignRefs so callers can
+/// pull raw colors/fonts (used by the kit-picker path to blend scraped
+/// tokens into the chosen palette so no two landing pages look alike).
+pub async fn gather_refs(idea: &str) -> Vec<DesignRef> {
     let client = build_client();
     let keyword = idea.split_whitespace().take(3).collect::<Vec<_>>().join("+");
 
@@ -43,13 +56,7 @@ pub async fn gather(idea: &str) -> String {
     if let Ok(mut r) = aww { refs.append(&mut r); }
     if let Ok(mut r) = si  { refs.append(&mut r); }
 
-    let enriched = enrich_with_tokens(&client, refs).await;
-
-    if enriched.is_empty() {
-        format!("No live references scraped for '{}'. Use your design knowledge.", keyword)
-    } else {
-        enriched.iter().map(|r| r.summary()).collect::<Vec<_>>().join("\n\n")
-    }
+    enrich_with_tokens(&client, refs).await
 }
 
 async fn scrape_awwwards(client: &Client, keyword: &str) -> Result<Vec<DesignRef>> {

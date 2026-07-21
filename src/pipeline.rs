@@ -38,6 +38,19 @@ pub enum AppEvent {
     /// After a design lands, suggest sub-pages the user could design next
     /// based on unwired nav links in the just-generated HTML.
     PageSuggestions { candidates: String }, // JSON: [{slug, name}]
+    /// Full per-project session snapshot sent on project open / switch so the
+    /// React store can rehydrate mode, brief, and token totals in one shot.
+    SessionSnapshot {
+        mode:       &'static str,
+        brief:      String,
+        tokens_in:  u64,
+        tokens_out: u64,
+    },
+    /// User picked (or the classifier resolved) a mode. UI updates its badge.
+    ModeSet { mode: &'static str },
+    /// `start_design` classified the idea as Ambiguous and needs the user to
+    /// pick Landing or App via the clarify picker.
+    ModeClarify { brief: String },
     TokenUsage {
         turn_input:     u32,
         turn_output:    u32,
@@ -69,35 +82,85 @@ pub async fn run(
     let mut knowledge       = KnowledgeBase::load();
     let mut current_project: Option<String> = None;
     let mut current_page:    String = "home".into();
+    let mut current_mode:   crate::session::Mode = crate::session::Mode::Ambiguous;
     let mut session_input:  u64 = 0;
     let mut session_output: u64 = 0;
 
-    let send_meta = |tx: &Sender<AppEvent>| {
-        let _ = tx.send(AppEvent::Meta { provider: provider_id.clone(), model: model.clone() });
+    // Track the last-sent model so we can re-emit Meta when the provider
+    // (e.g. claudecode) discloses a different one mid-run. Seed with the
+    // configured value; overridden on the first LLM completion.
+    let mut current_model = model.clone();
+    let send_meta = |tx: &Sender<AppEvent>, m: &str| {
+        let _ = tx.send(AppEvent::Meta { provider: provider_id.clone(), model: m.to_string() });
     };
 
-    send_meta(&tx);
+    send_meta(&tx, &current_model);
+    // If the provider already knows its model (SDK providers), publish it now.
+    if let Some(m) = provider.detected_model() {
+        if !m.is_empty() && m != current_model {
+            current_model = m.clone();
+            send_meta(&tx, &current_model);
+        }
+    }
     push_projects_list(&tx);
+
+    // Called after every LLM completion — cheap check, re-emits Meta only
+    // when the detected model actually changed.
+    let mut refresh_model = |tx: &Sender<AppEvent>, current_model: &mut String| {
+        if let Some(m) = provider.detected_model() {
+            if !m.is_empty() && m != *current_model {
+                *current_model = m.clone();
+                let _ = tx.send(AppEvent::Meta {
+                    provider: provider_id.clone(),
+                    model:    m,
+                });
+            }
+        }
+    };
 
     while let Some(msg) = rx.recv().await {
         match msg.kind.as_str() {
             "export"           => { let _ = tx.send(AppEvent::ExportDesign(msg.content));   continue; }
             "export_prototype" => { let _ = tx.send(AppEvent::ExportPrototype(msg.content)); continue; }
 
-            "list_projects" => { send_meta(&tx); push_projects_list(&tx); continue; }
+            "list_projects" => { send_meta(&tx, &current_model); push_projects_list(&tx); continue; }
 
             "create_project" => {
+                // Kill any in-flight generation on the outgoing project + flush
+                // its session before switching.
+                stop_flag.store(true, Ordering::SeqCst);
+                if let Some(ref outgoing) = current_project {
+                    let brief = match &state {
+                        State::Refining { idea, .. } => idea.as_str(), _ => "",
+                    };
+                    let tried = match &state {
+                        State::Refining { tried_archetypes, .. } => tried_archetypes.clone(),
+                        _ => Vec::new(),
+                    };
+                    persist_session(outgoing, current_mode, brief, &current_page, &tried, session_input, session_output);
+                }
+                stop_flag.store(false, Ordering::SeqCst);
+
                 match projects::create(msg.content.trim()) {
                     Ok(p) => {
                         current_project = Some(p.slug.clone());
                         current_page = "home".into();
+                        current_mode = crate::session::Mode::Ambiguous;
+                        session_input = 0;
+                        session_output = 0;
                         state = State::AwaitingIdea;
+                        // Seed session on disk so subsequent opens are consistent.
+                        let mut sess = crate::session::Session::default();
+                        sess.mode = current_mode;
+                        let _ = projects::write_session(&p.slug, &sess);
+
                         let _ = tx.send(AppEvent::ProjectOpened {
                             slug: p.slug.clone(),
                             name: p.name.clone(),
                             html: String::new(),
                             chat: "[]".into(),
                         });
+                        emit_session_snapshot(&tx, &sess);
                         push_projects_list(&tx);
                         push_pages(&tx, &p.slug);
                     }
@@ -112,6 +175,26 @@ pub async fn run(
 
             "open_project" => {
                 let slug = msg.content.trim().to_string();
+
+                // Kill any in-flight generation on the outgoing project + flush
+                // its session before switching. This is what makes
+                // per-project state safe when the user clicks another rail item
+                // mid-generation.
+                stop_flag.store(true, Ordering::SeqCst);
+                if let Some(ref outgoing) = current_project {
+                    if *outgoing != slug {
+                        let brief = match &state {
+                            State::Refining { idea, .. } => idea.as_str(), _ => "",
+                        };
+                        let tried = match &state {
+                            State::Refining { tried_archetypes, .. } => tried_archetypes.clone(),
+                            _ => Vec::new(),
+                        };
+                        persist_session(outgoing, current_mode, brief, &current_page, &tried, session_input, session_output);
+                    }
+                }
+                stop_flag.store(false, Ordering::SeqCst);
+
                 let manifest = projects::read_pages_manifest(&slug).unwrap_or_default();
                 current_page = manifest.active.clone();
                 let read_result = if current_page == "home" {
@@ -123,18 +206,36 @@ pub async fn run(
                     Ok(html) => {
                         current_project = Some(slug.clone());
                         let name = projects::name_of(&slug).unwrap_or_default();
-                        let chat = projects::read_chat(&slug).unwrap_or_else(|_| "[]".into());
+                        // Prefer new jsonl chat; fall back to legacy .chat.json.
+                        let chat = projects::read_chat_jsonl(&slug).ok()
+                            .filter(|s| s.trim() != "[]" && !s.trim().is_empty())
+                            .or_else(|| projects::read_chat(&slug).ok())
+                            .unwrap_or_else(|| "[]".into());
+
+                        // Load session, restoring mode + tokens + tried_archetypes.
+                        let sess = projects::read_session(&slug).unwrap_or_default();
+                        current_mode   = sess.mode;
+                        session_input  = sess.tokens_in;
+                        session_output = sess.tokens_out;
+
                         if !html.trim().is_empty() {
                             state = State::Refining {
                                 current: html.clone(),
-                                idea:    name.clone(),
+                                idea:    if sess.brief.is_empty() { name.clone() } else { sess.brief.clone() },
                                 theme:   String::new(),
-                                tried_archetypes: Vec::new(),
+                                tried_archetypes: sess.tried_archetypes.clone(),
                             };
                         } else {
                             state = State::AwaitingIdea;
                         }
+
                         let _ = tx.send(AppEvent::ProjectOpened { slug: slug.clone(), name, html, chat });
+                        emit_session_snapshot(&tx, &sess);
+                        // Emit current token totals so the pill matches the project.
+                        let _ = tx.send(AppEvent::TokenUsage {
+                            turn_input: 0, turn_output: 0,
+                            session_input, session_output, estimated: false,
+                        });
                         push_pages(&tx, &slug);
                     }
                     Err(e) => {
@@ -146,8 +247,32 @@ pub async fn run(
                 continue;
             }
 
+            "set_mode" => {
+                let m = crate::session::Mode::from_str(msg.content.trim())
+                    .unwrap_or(crate::session::Mode::Ambiguous);
+                current_mode = m;
+                let _ = tx.send(AppEvent::ModeSet { mode: m.as_str() });
+                if let Some(ref slug) = current_project {
+                    let brief = match &state {
+                        State::Refining { idea, .. } => idea.as_str(), _ => "",
+                    };
+                    let tried = match &state {
+                        State::Refining { tried_archetypes, .. } => tried_archetypes.clone(),
+                        _ => Vec::new(),
+                    };
+                    persist_session(slug, m, brief, &current_page, &tried, session_input, session_output);
+                }
+                // No auto-replay of a queued start_design — the UI held the
+                // payload and will re-send `start_design` once the badge flips.
+                continue;
+            }
+
             "save_chat" => {
                 if let Some(ref slug) = current_project {
+                    // React sends the entire messages array as JSON. Persist
+                    // as JSONL for streaming reads/appends. Keep legacy
+                    // .chat.json in sync as well until a future PR removes it.
+                    let _ = projects::overwrite_chat_from_array(slug, &msg.content);
                     let _ = projects::write_chat(slug, &msg.content);
                 }
                 continue;
@@ -253,6 +378,7 @@ pub async fn run(
                             tried_archetypes: Vec::new(),
                         };
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        refresh_model(&tx, &mut current_model);
                         persist_current(&current_project, &current_page, &state, &tx);
                         let _ = tx.send(AppEvent::DesignUpdate(html));
                         let _ = tx.send(AppEvent::AssistantMessage(
@@ -285,13 +411,35 @@ pub async fn run(
                     .unwrap_or(serde_json::Value::Null);
                 let idea  = payload["idea"].as_str().unwrap_or("").trim().to_string();
                 let theme = payload["theme"].as_str().unwrap_or("auto").trim().to_string();
+                let initial_pages: Vec<String> = payload["initial_pages"].as_array()
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect())
+                    .unwrap_or_default();
                 if idea.is_empty() { continue; }
+
+                // Mode routing: honor an explicitly-set mode on the project,
+                // else classify from the idea. Ambiguous → emit clarify chip
+                // and stop — the UI re-sends start_design once user picks.
+                if current_mode == crate::session::Mode::Ambiguous {
+                    let inferred = crate::session::infer_mode(&idea);
+                    if inferred == crate::session::Mode::Ambiguous {
+                        let _ = tx.send(AppEvent::ModeClarify { brief: idea.clone() });
+                        continue;
+                    }
+                    current_mode = inferred;
+                    let _ = tx.send(AppEvent::ModeSet { mode: current_mode.as_str() });
+                    if let Some(ref slug) = current_project {
+                        persist_session(slug, current_mode, &idea, &current_page, &[], session_input, session_output);
+                    }
+                }
 
                 stop_flag.store(false, Ordering::SeqCst);
                 let _ = tx.send(AppEvent::SetGenerating(true));
 
                 let result = handle_start_design(
-                    &idea, &theme, &[],
+                    &idea, &theme, &[], &initial_pages, current_mode,
                     &provider, &tx, stop_flag.clone(), &knowledge,
                 ).await;
 
@@ -301,17 +449,26 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        refresh_model(&tx, &mut current_model);
                         persist_current(&current_project, &current_page, &state, &tx);
+                        // Persist the session with the fresh brief + tokens.
+                        if let Some(ref slug) = current_project {
+                            let tried = match &state {
+                                State::Refining { tried_archetypes, .. } => tried_archetypes.clone(),
+                                _ => Vec::new(),
+                            };
+                            persist_session(slug, current_mode, &idea, &current_page, &tried, session_input, session_output);
+                        }
                         // On the home page of a project, suggest linked sub-pages
                         // the user could design next based on the generated nav.
                         if current_page == "home" {
                             if let (Some(slug), State::Refining { current, .. }) = (current_project.as_ref(), &state) {
                                 push_pages(&tx, slug);
-                                push_page_suggestions(&tx, slug, current);
+                                push_page_suggestions(&tx, &provider, &idea, slug, current);
                             }
                         }
                         if let State::Refining { current, .. } = &state {
-                            spawn_critique(current.clone(), provider.clone(), tx.clone());
+                            spawn_critique(current.clone(), current_mode, provider.clone(), tx.clone());
                         }
                     }
                     Err(e) if e.to_string() == "__stopped__" => {}
@@ -356,11 +513,13 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        refresh_model(&tx, &mut current_model);
                         persist_current(&current_project, &current_page, &state, &tx);
+                        // Kit-picker path = landing pages. Single-page by design —
+                        // no "design next page?" chips.
                         if current_page == "home" {
-                            if let (Some(slug), State::Refining { current, .. }) = (current_project.as_ref(), &state) {
+                            if let Some(slug) = current_project.as_ref() {
                                 push_pages(&tx, slug);
-                                push_page_suggestions(&tx, slug, current);
                             }
                         }
                     }
@@ -418,7 +577,7 @@ pub async fn run(
                 let _ = tx.send(AppEvent::SetGenerating(true));
 
                 let result = handle_start_design(
-                    &idea, &theme, &tried,
+                    &idea, &theme, &tried, &[], current_mode,
                     &provider, &tx, stop_flag.clone(), &knowledge,
                 ).await;
 
@@ -428,9 +587,10 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        refresh_model(&tx, &mut current_model);
                         persist_current(&current_project, &current_page, &state, &tx);
                         if let State::Refining { current, .. } = &state {
-                            spawn_critique(current.clone(), provider.clone(), tx.clone());
+                            spawn_critique(current.clone(), current_mode, provider.clone(), tx.clone());
                         }
                     }
                     Err(e) if e.to_string() == "__stopped__" => {}
@@ -461,7 +621,7 @@ pub async fn run(
 
                 let result = handle_refine_element(
                     &selector, &outer, &prompt, &current, &idea, &theme, &tried,
-                    &provider, &tx, stop_flag.clone(),
+                    current_mode, &provider, &tx, stop_flag.clone(),
                 ).await;
 
                 let _ = tx.send(AppEvent::SetGenerating(false));
@@ -470,6 +630,7 @@ pub async fn run(
                     Ok((next, usage)) => {
                         state = next;
                         emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        refresh_model(&tx, &mut current_model);
                         persist_current(&current_project, &current_page, &state, &tx);
                     }
                     Err(e) if e.to_string() == "__stopped__" => {}
@@ -530,7 +691,7 @@ pub async fn run(
                 stop_flag.store(false, Ordering::SeqCst);
                 let _ = tx.send(AppEvent::SetGenerating(true));
                 let r = handle_refine(
-                    &content, current, idea, theme, tried_archetypes,
+                    &content, current, idea, theme, tried_archetypes, current_mode,
                     &provider, &tx, stop_flag.clone(), &knowledge,
                 ).await;
                 let _ = tx.send(AppEvent::SetGenerating(false));
@@ -548,6 +709,7 @@ pub async fn run(
             Ok((next, usage)) => {
                 state = next;
                 emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        refresh_model(&tx, &mut current_model);
                 persist_current(&current_project, &current_page, &state, &tx);
             }
             Err(e) if e.to_string() == "__stopped__" => {}
@@ -616,9 +778,43 @@ Now output the complete HTML for the {page_name} page. Same shell, new workspace
         brief_line = if user_brief.is_empty() { String::new() } else { format!("Brief: {user_brief}") },
     );
 
-    let comp = stream_generate(provider, system, &user, 8000, tx, stop).await?;
+    // Sub-page of a multi-page project → always App mode context.
+    let comp = stream_generate(provider, crate::session::Mode::App, system, &user, 8000, tx, stop).await?;
     let usage = usage_or_estimate(comp.usage, system, &user, &comp.text);
     Ok((comp.text, usage))
+}
+
+/// Snapshot mode/tokens/tried_archetypes/brief into the project's session
+/// file. Best-effort; failures are silent (session is a nice-to-have, not
+/// load-bearing for the current design pass).
+fn persist_session(
+    slug:          &str,
+    mode:          crate::session::Mode,
+    brief:         &str,
+    active_page:   &str,
+    tried:         &[String],
+    tokens_in:     u64,
+    tokens_out:    u64,
+) {
+    let mut sess = projects::read_session(slug).unwrap_or_default();
+    sess.mode = mode;
+    if !brief.is_empty() { sess.brief = brief.to_string(); }
+    sess.active_page = active_page.to_string();
+    sess.tried_archetypes = tried.to_vec();
+    sess.tokens_in  = tokens_in;
+    sess.tokens_out = tokens_out;
+    sess.touch();
+    let _ = projects::write_session(slug, &sess);
+}
+
+fn emit_session_snapshot(tx: &Sender<AppEvent>, sess: &crate::session::Session) {
+    let _ = tx.send(AppEvent::SessionSnapshot {
+        mode:       sess.mode.as_str(),
+        brief:      sess.brief.clone(),
+        tokens_in:  sess.tokens_in,
+        tokens_out: sess.tokens_out,
+    });
+    let _ = tx.send(AppEvent::ModeSet { mode: sess.mode.as_str() });
 }
 
 fn persist_current(
@@ -639,34 +835,164 @@ fn persist_current(
     }
 }
 
-/// After a design lands, scan the HTML for `<a href="./XXX.html">LABEL</a>`
-/// links, cross-reference against the project's page manifest, and return the
-/// pages that are linked but don't exist yet. UI shows these as "Design next?"
-/// chips.
+/// After a design lands, produce up to 6 sibling-page candidates for the UI
+/// "Design next?" chips. Sources, in priority order:
+///
+/// 1. Anchors with slug-shaped hrefs (`./workouts.html`, `/workouts`, `#workouts`).
+/// 2. Labels of anchors/buttons inside nav regions (`<aside>`, `<nav>`, or
+///    id/class containing sidebar/topbar/nav/menu) — captures placeholder
+///    `href="#"` sidebars.
+///
+/// Filters: skip in-page anchors whose slug matches an existing `id="…"`,
+/// skip pages already in the manifest, dedupe by slug, cap at 6.
 fn suggest_next_pages(html: &str, project_slug: &str) -> Vec<(String, String)> {
     use regex::Regex;
-    let re = Regex::new(r#"<a[^>]+href=["']\.?/?([a-zA-Z0-9-_]+)\.html["'][^>]*>([^<]{1,60})</a>"#)
-        .unwrap();
+    let anchor_re  = Regex::new(r#"<a[^>]+href=["']([^"']+)["'][^>]*>([^<]{1,60})</a>"#).unwrap();
+    let id_re      = Regex::new(r#"\bid=["']([a-zA-Z0-9\-_]+)["']"#).unwrap();
+    // Locate nav-scoped regions (aside / nav elements, or containers whose
+    // id/class contains sidebar/topbar/nav/menu). We slice their inner HTML
+    // and extract every <a>/<button> label — hrefs may be `#` placeholders.
+    let nav_region_re = Regex::new(
+        r#"(?is)<(aside|nav)\b[^>]*>(.*?)</\1>|<(?:div|section|header|ul)\b[^>]*(?:id|class)=["'][^"']*(?:sidebar|topbar|nav|menu)[^"']*["'][^>]*>(.*?)</(?:div|section|header|ul)>"#,
+    ).unwrap();
+    let label_re = Regex::new(r#"(?is)<(?:a|button)\b[^>]*>(.*?)</(?:a|button)>"#).unwrap();
+    let tag_strip_re = Regex::new(r"(?is)<[^>]+>").unwrap();
+    let ws_re = Regex::new(r"\s+").unwrap();
+
+    let existing_ids: std::collections::HashSet<String> = id_re
+        .captures_iter(html)
+        .filter_map(|c| c.get(1).map(|m| projects::slugify(m.as_str())))
+        .collect();
 
     let manifest = projects::read_pages_manifest(project_slug).unwrap_or_default();
-    let existing: std::collections::HashSet<String> =
+    let existing_pages: std::collections::HashSet<String> =
         manifest.pages.iter().map(|p| p.slug.clone()).collect();
 
     let mut seen = std::collections::HashSet::new();
     let mut out  = Vec::new();
 
-    for cap in re.captures_iter(html) {
-        let raw_slug  = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let raw_label = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
-        if raw_slug.is_empty() || raw_label.is_empty() { continue; }
-        let slug = projects::slugify(raw_slug);
-        if slug == "home" || slug == "index" { continue; }
-        if existing.contains(&slug) { continue; }
-        if !seen.insert(slug.clone()) { continue; }
-        out.push((slug, raw_label.into()));
+    // Helper closures.
+    let is_valid_slug = |slug: &str| -> bool {
+        !slug.is_empty() && slug != "home" && slug != "index"
+            && !existing_pages.contains(slug) && !existing_ids.contains(slug)
+    };
+    let mut push_candidate = |slug: String, label: String, seen: &mut std::collections::HashSet<String>, out: &mut Vec<(String, String)>| {
+        if !is_valid_slug(&slug) { return; }
+        if !seen.insert(slug.clone()) { return; }
+        out.push((slug, label));
+    };
+
+    // Pass 1 — hrefs with slug-shaped targets.
+    for cap in anchor_re.captures_iter(html) {
         if out.len() >= 6 { break; }
+        let href      = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let raw_label = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        if href.is_empty() || raw_label.is_empty() { continue; }
+
+        let lower = href.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://")
+            || lower.starts_with("mailto:") || lower.starts_with("tel:")
+            || lower.starts_with("javascript:") || lower.starts_with("data:")
+            || lower == "#"
+        { continue; }
+
+        let mut s = href.trim_start_matches('#')
+                        .trim_start_matches("./")
+                        .trim_start_matches('/');
+        if let Some(i) = s.find(&['?', '#'][..]) { s = &s[..i]; }
+        let s = s.trim_end_matches(".html").trim_end_matches(".htm");
+        if s.is_empty() { continue; }
+        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/') {
+            continue;
+        }
+        let seg = s.rsplit('/').next().unwrap_or(s);
+        if seg.is_empty() { continue; }
+
+        let slug = projects::slugify(seg);
+        push_candidate(slug, raw_label.to_string(), &mut seen, &mut out);
     }
+
+    // Pass 2 — labels inside nav-scoped regions. Only runs if pass 1 left room.
+    if out.len() < 6 {
+        for region_cap in nav_region_re.captures_iter(html) {
+            if out.len() >= 6 { break; }
+            let inner = region_cap.get(2).or_else(|| region_cap.get(3))
+                .map(|m| m.as_str()).unwrap_or("");
+            for lcap in label_re.captures_iter(inner) {
+                if out.len() >= 6 { break; }
+                let raw = lcap.get(1).map(|m| m.as_str()).unwrap_or("");
+                let stripped = tag_strip_re.replace_all(raw, "");
+                let label = ws_re.replace_all(stripped.trim(), " ").to_string();
+                if label.is_empty() || label.len() > 60 { continue; }
+                let slug = projects::slugify(&label);
+                push_candidate(slug, label, &mut seen, &mut out);
+            }
+        }
+    }
+
     out
+}
+
+/// Best-effort LLM fallback for `push_page_suggestions` when both href
+/// extraction and nav-label extraction return no candidates. Small
+/// non-streaming call; any parse error returns an empty list so the UI just
+/// silently omits chips.
+async fn suggest_next_pages_llm(
+    provider: &Provider,
+    idea: &str,
+    html: &str,
+    project_slug: &str,
+) -> Vec<(String, String)> {
+    use regex::Regex;
+    let id_re = Regex::new(r#"\bid=["']([a-zA-Z0-9\-_]+)["']"#).unwrap();
+    let existing_ids: Vec<String> = id_re
+        .captures_iter(html)
+        .filter_map(|c| c.get(1).map(|m| projects::slugify(m.as_str())))
+        .collect();
+
+    let system = ai::prompts::NEXT_PAGES_SUGGEST_SYSTEM;
+    let user   = ai::prompts::next_pages_suggest_user(idea, &existing_ids);
+
+    let comp = match provider.complete(system, &user, 200).await {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let cleaned = ai::clean(comp.text);
+
+    // Trim optional markdown fences the model might emit despite instructions.
+    let json_str = cleaned.trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    #[derive(serde::Deserialize)]
+    struct Suggestion { name: String, slug: String }
+    let parsed: Vec<Suggestion> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let manifest = projects::read_pages_manifest(project_slug).unwrap_or_default();
+    let existing_pages: std::collections::HashSet<String> =
+        manifest.pages.iter().map(|p| p.slug.clone()).collect();
+    let existing_ids_set: std::collections::HashSet<String> =
+        existing_ids.into_iter().collect();
+
+    let mut seen = std::collections::HashSet::new();
+    parsed.into_iter()
+        .filter_map(|s| {
+            let slug = projects::slugify(&s.slug);
+            let name = s.name.trim().to_string();
+            if slug.is_empty() || name.is_empty() { return None; }
+            if slug == "home" || slug == "index" { return None; }
+            if existing_pages.contains(&slug) { return None; }
+            if existing_ids_set.contains(&slug) { return None; }
+            if !seen.insert(slug.clone()) { return None; }
+            Some((slug, name))
+        })
+        .take(4)
+        .collect()
 }
 
 fn push_pages(tx: &Sender<AppEvent>, project_slug: &str) {
@@ -675,9 +1001,39 @@ fn push_pages(tx: &Sender<AppEvent>, project_slug: &str) {
     let _ = tx.send(AppEvent::PagesList { pages: json, active: manifest.active });
 }
 
-fn push_page_suggestions(tx: &Sender<AppEvent>, project_slug: &str, html: &str) {
+/// Fire-and-forget page-suggestion pass. Runs the fast regex extractors
+/// first; if they turn up nothing, spawns a best-effort LLM fallback so the
+/// UI still gets chips for dashboards whose sidebars have no navigable
+/// hrefs or labels. Always emits at most one PageSuggestions event.
+fn push_page_suggestions(
+    tx: &Sender<AppEvent>,
+    provider: &Provider,
+    idea: &str,
+    project_slug: &str,
+    html: &str,
+) {
     let candidates = suggest_next_pages(html, project_slug);
-    if candidates.is_empty() { return; }
+    if !candidates.is_empty() {
+        emit_page_suggestions(tx, &candidates);
+        return;
+    }
+    // No regex hits — try the LLM fallback in the background. If it also
+    // returns empty, the UI simply doesn't render chips (matches today's
+    // behavior). Never blocks the main design flow.
+    let tx2       = tx.clone();
+    let provider2 = provider.clone();
+    let idea2     = idea.to_string();
+    let slug2     = project_slug.to_string();
+    let html2     = html.to_string();
+    tokio::spawn(async move {
+        let candidates = suggest_next_pages_llm(&provider2, &idea2, &html2, &slug2).await;
+        if !candidates.is_empty() {
+            emit_page_suggestions(&tx2, &candidates);
+        }
+    });
+}
+
+fn emit_page_suggestions(tx: &Sender<AppEvent>, candidates: &[(String, String)]) {
     let json: String = serde_json::to_string(
         &candidates.iter()
             .map(|(slug, name)| serde_json::json!({ "slug": slug, "name": name }))
@@ -693,15 +1049,16 @@ fn push_projects_list(tx: &Sender<AppEvent>) {
 }
 
 async fn stream_generate(
-    provider: &Provider, system: &str, user: &str, max_tokens: u32,
+    provider: &Provider, mode: crate::session::Mode,
+    system: &str, user: &str, max_tokens: u32,
     tx: &Sender<AppEvent>, stop: Arc<AtomicBool>,
 ) -> Result<ai::Completion> {
     let tx2 = tx.clone();
-    // The SYSTEM_CONTEXT (design knowledge + image toolkit) is a big static
-    // prefix identical across every call. Sending it as a cacheable block
-    // enables Anthropic prompt caching and OpenAI's implicit caching.
+    // The mode-scoped system context is a big static prefix identical across
+    // every call within a mode. Sending it as a cacheable block enables
+    // Anthropic prompt caching and OpenAI's implicit caching.
     let comp = provider.complete_streaming_cached(
-        system, ai::prompts::SYSTEM_CONTEXT, user, max_tokens,
+        system, ai::prompts::system_context(mode), user, max_tokens,
         Box::new(move |chunk| { let _ = tx2.send(AppEvent::ThinkingChunk(chunk)); }),
         stop,
     ).await?;
@@ -739,6 +1096,8 @@ fn extract_archetype(html: &str) -> Option<String> {
 
 async fn handle_start_design(
     idea: &str, theme: &str, tried: &[String],
+    initial_pages: &[String],
+    mode: crate::session::Mode,
     provider: &Provider,
     tx: &Sender<AppEvent>, stop: Arc<AtomicBool>,
     knowledge: &KnowledgeBase,
@@ -780,8 +1139,8 @@ async fn handle_start_design(
 
     let excluded = tried.join(", ");
     let system = ai::prompts::SKELETON_SINGLE_STYLED_SYSTEM;
-    let user   = ai::prompts::skeleton_single_styled_user(idea, theme, &excluded, &combined_refs, &knowledge.prompt_context());
-    let comp = stream_generate(provider, system, &user, 8000, tx, stop).await?;
+    let user   = ai::prompts::skeleton_single_styled_user(idea, theme, &excluded, &combined_refs, &knowledge.prompt_context(), initial_pages);
+    let comp = stream_generate(provider, mode, system, &user, 8000, tx, stop).await?;
     let usage = usage_or_estimate(comp.usage, system, &user, &comp.text);
 
     let archetype = extract_archetype(&comp.text).unwrap_or_else(|| "unknown".into());
@@ -807,6 +1166,7 @@ async fn handle_start_design(
 
 async fn handle_refine(
     feedback: &str, current: &str, idea: &str, theme: &str, tried: &[String],
+    mode: crate::session::Mode,
     provider: &Provider,
     tx: &Sender<AppEvent>, stop: Arc<AtomicBool>,
     knowledge: &KnowledgeBase,
@@ -815,7 +1175,7 @@ async fn handle_refine(
     let system  = ai::prompts::REFINE_SYSTEM;
     let bounded = bound_html(current, 40_000);
     let user    = ai::prompts::refine_user(&bounded, feedback, &knowledge.prompt_context());
-    let comp = stream_generate(provider, system, &user, 6000, tx, stop).await?;
+    let comp = stream_generate(provider, mode, system, &user, 6000, tx, stop).await?;
     let usage = usage_or_estimate(comp.usage, system, &user, &comp.text);
 
     let _ = tx.send(AppEvent::DesignUpdate(comp.text.clone()));
@@ -835,6 +1195,7 @@ async fn handle_refine(
 async fn handle_refine_element(
     selector: &str, outer_html: &str, feedback: &str,
     current: &str, idea: &str, theme: &str, tried: &[String],
+    mode: crate::session::Mode,
     provider: &Provider,
     tx: &Sender<AppEvent>, stop: Arc<AtomicBool>,
 ) -> Result<(State, ai::Usage)> {
@@ -843,7 +1204,7 @@ async fn handle_refine_element(
     ));
     let system = ai::prompts::ELEMENT_REFINE_SYSTEM;
     let user   = ai::prompts::element_refine_user(selector, outer_html, feedback);
-    let comp   = stream_generate(provider, system, &user, 3000, tx, stop).await?;
+    let comp   = stream_generate(provider, mode, system, &user, 3000, tx, stop).await?;
     let usage  = usage_or_estimate(comp.usage, system, &user, &comp.text);
 
     let new_element = comp.text.trim().to_string();
@@ -919,9 +1280,40 @@ async fn handle_assemble(
     } else {
         theme.meta.get("palette").cloned().unwrap_or_else(|| "warm-cream-brick".into())
     };
-    let palette = lib.palettes.get(&palette_key)
+    let base_palette = lib.palettes.get(&palette_key)
         .or_else(|| lib.palettes.get("warm-cream-brick"))
         .ok_or_else(|| anyhow::anyhow!("no palettes available"))?;
+
+    // ── Scrape design references for palette uniqueness ────────────────
+    // Kit-picker layouts are hand-authored (17 fixed variants); without any
+    // web input, every page ends up looking the same. Blend scraped colors
+    // into the chosen palette so the color story is unique per generation.
+    // 8s hard timeout; failure is silent (falls back to the base palette).
+    let _ = tx.send(AppEvent::StatusUpdate("Scraping refs for palette uniqueness…".into()));
+    let scraped_refs = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        scraper::gather_refs(idea),
+    ).await.unwrap_or_default();
+
+    let scraped_colors: Vec<String> = scraped_refs.iter().flat_map(|r| r.colors.clone()).collect();
+    let blended = blend_palette(base_palette, &scraped_colors);
+    // From here on, `palette` is the blended version (or a clone of the base
+    // if scraping failed or returned fewer than 3 colors).
+    let palette: &crate::variants::Palette = if scraped_colors.len() >= 3 { &blended } else { base_palette };
+    if scraped_colors.len() >= 3 {
+        let _ = tx.send(AppEvent::StatusUpdate(
+            format!("Blended {} scraped colors into palette…", scraped_colors.len())
+        ));
+    }
+
+    // Build a compact ref summary for the placeholder LLM — grounds copy
+    // in the tone of real award-winning sites in the subject's category.
+    let refs_prompt_block = if scraped_refs.is_empty() {
+        String::new()
+    } else {
+        let block = scraped_refs.iter().take(3).map(|r| r.summary()).collect::<Vec<_>>().join("\n");
+        format!("\n\nReference sites in this category (for tone only — do NOT copy content):\n{block}\n")
+    };
 
     // Resolve variant for each category — user pick, else first available.
     let categories = ["navbar", "hero", "features", "testimonials", "pricing", "cta", "footer"];
@@ -948,9 +1340,13 @@ async fn handle_assemble(
         format!("Filling {} placeholders for \"{}\"…", all_placeholders.len(), idea)
     ));
 
-    let system = "You are a UX copywriter filling placeholders for a web interface (could be a landing page, dashboard, product UI, admin panel, portfolio, or any other type). \
-Output STRICTLY a JSON object mapping each placeholder key (uppercase, underscored) \
-to a concrete filled string. Follow these rules:\n\
+    let system = "You are a UX copywriter AND design director filling both COPY placeholders and STYLE tweaks for a web landing page. You have three inputs: the subject, the user's picked kit (theme + variants), and scraped reference sites in the same category. Blend them.\n\n\
+Output STRICTLY a single JSON object with TWO top-level keys:\n\
+  {\n\
+    \"placeholders\": { \"KEY\": \"value\", ... },\n\
+    \"tweaks\":       { \"radius\": \"8px\", \"shadow\": \"...\", \"section_gap\": \"96px\" }\n\
+  }\n\n\
+PLACEHOLDER rules:\n\
 - Use specific nouns from the subject's world, never generic benefit words.\n\
 - Headlines: 8-14 words, ONE concrete noun the audience recognizes.\n\
 - Subheads: 12-24 words, elaborate the specific benefit.\n\
@@ -960,30 +1356,52 @@ to a concrete filled string. Follow these rules:\n\
 - Image URLs: use https://loremflickr.com/{W}/{H}/{keywords}?lock={seed} matched to subject, OR https://i.pravatar.cc/{size}?img={1..70} for avatars.\n\
 - Feature titles: 2-4 words, concrete product noun.\n\
 - Use realistic email placeholders (e.g. \"you@studio.co\").\n\
-No prose. No markdown fences. Just a JSON object.";
+- Copy tone should feel drawn from the reference sites — not copied, but same register.\n\n\
+TWEAK rules (each tweak is a CSS value, kept short so it drops into a :root block):\n\
+- radius: corner rounding shared across cards/buttons. Pick between \"2px\" (brutalist/technical), \"4-6px\" (editorial/minimal), \"10-16px\" (playful/warm), \"999px\" (soft). Match the vibe of the theme AND the scraped refs.\n\
+- shadow: box-shadow for elevated cards. Should feel consistent with the palette — cool palettes get bluish shadows, warm palettes get warm-brown shadows.\n\
+- section_gap: vertical padding between sections. Denser subjects (SaaS, dashboards, admin) → 64-80px. Editorial / luxury → 120-160px.\n\n\
+Only these three tweak keys. All required. No prose. No markdown fences. Just the JSON object.";
 
     let user = format!(
-        "Subject: {idea}\nTone package: {theme_id}\n\nFill these placeholder keys with concrete values suitable for \"{idea}\":\n\n{}\n\nReturn a JSON object like {{\"KEY\": \"value\", ...}}. Every key above must appear once.",
+        "Subject: {idea}\nTone package: {theme_id}{refs_prompt_block}\n\nFill these placeholder keys with concrete values suitable for \"{idea}\":\n\n{}\n\nReturn a JSON object with `placeholders` (every key above must appear once) and `tweaks` (radius, shadow, section_gap).",
         all_placeholders.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"),
     );
 
-    // Assembly LLM outputs JSON, not HTML — DON'T stream chunks to the
-    // preview iframe or the right pane will show raw text mid-flight.
+    // Kit-picker path = Landing mode by definition. Assembly LLM outputs
+    // JSON, not HTML — DON'T stream chunks to the preview iframe.
     let comp = provider.complete_streaming_cached(
-        system, ai::prompts::SYSTEM_CONTEXT, &user, 3500,
+        system,
+        ai::prompts::system_context(crate::session::Mode::Landing),
+        &user, 3500,
         Box::new(|_| {}),
         stop,
     ).await?;
     let comp = ai::Completion { text: ai::clean(comp.text), usage: comp.usage };
     let usage = usage_or_estimate(comp.usage, system, &user, &comp.text);
 
-    let fills = parse_placeholder_fills(&comp.text, &all_placeholders);
+    // The LLM output is now {placeholders: {…}, tweaks: {radius, shadow, section_gap}}.
+    // Parse both — falling back gracefully if the model returned only the flat
+    // placeholders dict (older shape).
+    let (fills, tweaks) = parse_fills_and_tweaks(&comp.text, &all_placeholders);
+    let scraped_font = select_scraped_font(&scraped_refs);
+    if !tweaks.is_empty() || scraped_font.is_some() {
+        let _ = tx.send(AppEvent::StatusUpdate(
+            format!("Weaving {} style tweaks{}…",
+                tweaks.len(),
+                if scraped_font.is_some() { " + scraped font" } else { "" })
+        ));
+    }
+
+    // Fold the LLM tweaks + scraped font into a fresh palette (owned) so the
+    // rest of the pipeline sees a single Palette carrying every override.
+    let final_palette = apply_style_tweaks(palette, &tweaks);
 
     // ── Progressive assembly reveal ──
     // Instead of showing the completed HTML in one flash, add sections one at
     // a time to the preview iframe. Each step is a full HTML snapshot with a
     // growing <body>. Small delays make the build feel intentional.
-    let (shell_open, shell_close) = assemble_shell(theme, palette, &selected, idea);
+    let (shell_open, shell_close) = assemble_shell_ext(theme, &final_palette, &selected, idea, scraped_font.as_deref());
     // Frame 0: empty styled shell — user sees the palette + typography land.
     let empty = format!("{shell_open}{shell_close}");
     let _ = tx.send(AppEvent::AssemblyPreview(empty.clone()));
@@ -1029,7 +1447,18 @@ No prose. No markdown fences. Just a JSON object.";
 /// Parse the LLM's JSON dict of placeholder fills, tolerant of markdown fences
 /// and unbalanced quoting. Fills in any missing keys with a fallback.
 fn parse_placeholder_fills(raw: &str, keys: &[String]) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
+    let (fills, _) = parse_fills_and_tweaks(raw, keys);
+    fills
+}
+
+/// Parse the placeholder-fill LLM's JSON. Supports two shapes:
+///   NEW: {"placeholders": {…}, "tweaks": {radius, shadow, section_gap}}
+///   OLD: {"KEY": "value", …}   (flat placeholders dict, no tweaks)
+/// Fallbacks fill any missing placeholder keys. Tweaks map may be empty.
+fn parse_fills_and_tweaks(raw: &str, keys: &[String]) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut fills:  HashMap<String, String> = HashMap::new();
+    let mut tweaks: HashMap<String, String> = HashMap::new();
+
     let stripped = raw.trim()
         .trim_start_matches("```json").trim_start_matches("```")
         .trim_end_matches("```").trim();
@@ -1039,23 +1468,86 @@ fn parse_placeholder_fills(raw: &str, keys: &[String]) -> HashMap<String, String
         if b > a {
             let json_str = &stripped[a..=b];
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(obj) = v.as_object() {
+                // Prefer the new two-key shape when present.
+                let ph_obj    = v.get("placeholders").and_then(|x| x.as_object());
+                let tweak_obj = v.get("tweaks").and_then(|x| x.as_object());
+                let flat_obj  = if ph_obj.is_none() && tweak_obj.is_none() {
+                    v.as_object()
+                } else { None };
+
+                let source = ph_obj.or(flat_obj);
+                if let Some(obj) = source {
                     for (k, val) in obj {
                         let s = val.as_str().map(|s| s.to_string())
                             .unwrap_or_else(|| val.to_string().trim_matches('"').to_string());
-                        out.insert(k.clone(), s);
+                        fills.insert(k.clone(), s);
+                    }
+                }
+                if let Some(obj) = tweak_obj {
+                    for (k, val) in obj {
+                        let s = val.as_str().map(|s| s.to_string())
+                            .unwrap_or_else(|| val.to_string().trim_matches('"').to_string());
+                        if !s.is_empty() { tweaks.insert(k.clone(), s); }
                     }
                 }
             }
         }
     }
-    // Fallback: any key the LLM missed gets a sensible placeholder.
     for k in keys {
-        if !out.contains_key(k) {
-            out.insert(k.clone(), fallback_for(k));
+        if !fills.contains_key(k) {
+            fills.insert(k.clone(), fallback_for(k));
         }
     }
-    out
+    (fills, tweaks)
+}
+
+/// Fold LLM style tweaks into a copy of the base palette. Radius / shadow /
+/// section_gap get appended (or replaced) as :root custom properties. Also
+/// wraps the shadow value in `var()` fallback so downstream CSS that reads
+/// --shadow-elev works verbatim.
+fn apply_style_tweaks(base: &crate::variants::Palette, tweaks: &HashMap<String, String>) -> crate::variants::Palette {
+    if tweaks.is_empty() { return base.clone(); }
+    let mut body = base.body.clone();
+    let mut ensure = |name: &str, value: &str| {
+        // If the base body already defines this var, overwrite; else append.
+        if body.contains(&format!("--{}:", name)) || body.contains(&format!("--{}: ", name)) {
+            body = replace_css_var(&body, &format!("--{}", name), value);
+        } else {
+            if !body.ends_with('\n') { body.push('\n'); }
+            body.push_str(&format!("--{}: {};\n", name, value));
+        }
+    };
+    if let Some(v) = tweaks.get("radius")      { ensure("radius",      v); }
+    if let Some(v) = tweaks.get("shadow")      { ensure("shadow-elev", v); }
+    if let Some(v) = tweaks.get("section_gap") { ensure("section-gap", v); }
+    crate::variants::Palette {
+        id:   format!("{}+tweaks", base.id),
+        tags: base.tags.clone(),
+        body,
+    }
+}
+
+/// Pick the first scraped font that looks like a plausible Google Font
+/// family name (not a generic keyword or system stack). Case-insensitive
+/// check against the well-known aliases.
+fn select_scraped_font(refs: &[scraper::DesignRef]) -> Option<String> {
+    let bad = ["system-ui", "-apple-system", "blinkmacsystemfont", "segoe ui", "helvetica",
+               "arial", "sans-serif", "serif", "monospace", "inherit", "ui-monospace", "ui-sans-serif"];
+    for r in refs {
+        for f in &r.fonts {
+            let name = f.trim().trim_matches('"').trim_matches('\'').trim().to_string();
+            if name.is_empty() { continue; }
+            let low = name.to_ascii_lowercase();
+            if bad.iter().any(|b| low == *b || low.starts_with(&format!("{}, ", b))) { continue; }
+            // Cheap plausibility gate — Google Fonts names are letter-and-space,
+            // 3 to 30 chars, start with a letter.
+            let ok = name.chars().all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '-')
+                && name.len() >= 3 && name.len() <= 30
+                && name.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false);
+            if ok { return Some(name); }
+        }
+    }
+    None
 }
 
 fn fallback_for(key: &str) -> String {
@@ -1118,11 +1610,176 @@ fn pretty_category(cat: &str) -> String {
 
 /// Split assembly output into (shell_open, shell_close). Body concatenates
 /// between them. Used by the progressive assembly reveal.
+// ── Palette blending (kit-picker uniqueness) ─────────────────────────────
+//
+// Scraped color hex codes get sorted by luminance + saturation and mapped
+// onto the base palette's semantic slots (--paper / --ink / --accent). The
+// layout structure stays hand-authored; only the color story changes so
+// no two kit-picker landing pages look the same.
+
+fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
+    let s = hex.trim().trim_start_matches('#');
+    if s.len() != 6 { return None; }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+fn luminance(r: u8, g: u8, b: u8) -> f32 {
+    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0
+}
+fn saturation(r: u8, g: u8, b: u8) -> f32 {
+    let max = r.max(g).max(b) as f32 / 255.0;
+    let min = r.min(g).min(b) as f32 / 255.0;
+    if max <= 0.0 { 0.0 } else { (max - min) / max }
+}
+
+fn replace_css_var(body: &str, var_name: &str, value: &str) -> String {
+    // Replace a `--var: value;` line inside a CSS-property block. Preserves
+    // any leading whitespace so the block's formatting stays intact.
+    let escaped = regex::escape(var_name);
+    let re = match regex::Regex::new(&format!(r"(?m)^([\t ]*){}\s*:\s*[^;]+;", escaped)) {
+        Ok(re) => re, Err(_) => return body.to_string(),
+    };
+    re.replace(body, format!("$1{}: {};", var_name, value).as_str()).to_string()
+}
+
+// WCAG relative-luminance contrast ratio (needs sRGB-linear luminance, but a
+// simple gamma-approx works well enough for the go/no-go check we care about).
+fn relative_luminance(r: u8, g: u8, b: u8) -> f32 {
+    let f = |c: u8| {
+        let x = c as f32 / 255.0;
+        if x <= 0.03928 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+}
+fn contrast_ratio(a: (u8,u8,u8), b: (u8,u8,u8)) -> f32 {
+    let la = relative_luminance(a.0, a.1, a.2);
+    let lb = relative_luminance(b.0, b.1, b.2);
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Read the current value of `var_name` from a `:root` body (best-effort:
+/// returns the RGB triple if the value is a #hex we can parse).
+fn parse_var_hex(body: &str, var_name: &str) -> Option<(u8, u8, u8)> {
+    let escaped = regex::escape(var_name);
+    let re = regex::Regex::new(&format!(r"(?m)^[\t ]*{}\s*:\s*(#[0-9a-fA-F]{{6}})\s*;", escaped)).ok()?;
+    let cap = re.captures(body)?;
+    parse_hex(cap.get(1)?.as_str())
+}
+
+fn blend_palette(base: &Variant_Palette, scraped_colors: &[String]) -> Variant_Palette {
+    let mut valid: Vec<(String, (u8, u8, u8), f32, f32)> = scraped_colors.iter()
+        .filter_map(|h| parse_hex(h).map(|rgb| {
+            let l = luminance(rgb.0, rgb.1, rgb.2);
+            let s = saturation(rgb.0, rgb.1, rgb.2);
+            (h.trim().to_string(), rgb, l, s)
+        }))
+        .collect();
+    if valid.len() < 3 { return base.clone(); }
+    valid.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Detect the base palette's polarity so we don't invert light/dark.
+    // Dark palettes have a low-luminance --paper; ink must stay light.
+    let base_paper = parse_var_hex(&base.body, "--paper");
+    let base_ink   = parse_var_hex(&base.body, "--ink");
+    let is_dark_palette = base_paper
+        .map(|(r,g,b)| relative_luminance(r,g,b) < 0.15)
+        .unwrap_or(false);
+
+    let (paper_target_lum_gt, ink_target_lum_lt) = if is_dark_palette {
+        // paper must stay dark (< 0.15), ink must stay light (> 0.55)
+        (false, false)
+    } else {
+        // light palette: paper light (> 0.85), ink dark (< 0.30)
+        (true, true)
+    };
+
+    let mut body = base.body.clone();
+
+    // --paper override
+    let paper_candidate = if paper_target_lum_gt {
+        valid.iter().rev().find(|v| v.2 > 0.85).cloned()
+    } else {
+        valid.iter().find(|v| v.2 < 0.15).cloned()
+    };
+    let mut new_paper_rgb = base_paper;
+    if let Some((hex, rgb, _, _)) = paper_candidate {
+        body = replace_css_var(&body, "--paper", &hex);
+        new_paper_rgb = Some(rgb);
+    }
+
+    // --ink override — MUST contrast with the (possibly new) --paper.
+    let ink_candidate = if ink_target_lum_lt {
+        valid.iter().find(|v| v.2 < 0.30).cloned()
+    } else {
+        valid.iter().rev().find(|v| v.2 > 0.55).cloned()
+    };
+    if let Some((hex, rgb, _, _)) = ink_candidate {
+        // Contrast gate: only override if the pair still passes AA (4.5:1).
+        let paper_ref = new_paper_rgb.or(base_paper).unwrap_or((255,255,255));
+        if contrast_ratio(rgb, paper_ref) >= 4.5 {
+            body = replace_css_var(&body, "--ink", &hex);
+        }
+    }
+
+    // --accent: most saturated mid-luminance color; must contrast against paper
+    // enough that CTAs are readable (3:1 minimum for large text).
+    let paper_for_accent = new_paper_rgb.or(base_paper).unwrap_or((255,255,255));
+    let accent = valid.iter()
+        .filter(|v| v.2 > 0.15 && v.2 < 0.85 && v.3 > 0.30)
+        .filter(|v| contrast_ratio(v.1, paper_for_accent) >= 3.0)
+        .max_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+        .cloned();
+    if let Some((hex, (r,g,b), _, _)) = accent {
+        body = replace_css_var(&body, "--accent", &hex);
+        let darker = format!("#{:02x}{:02x}{:02x}",
+            (r as f32 * 0.85) as u8, (g as f32 * 0.85) as u8, (b as f32 * 0.85) as u8);
+        body = replace_css_var(&body, "--accent-2", &darker);
+        let soft = format!("rgba({},{},{},0.08)", r, g, b);
+        body = replace_css_var(&body, "--accent-soft", &soft);
+    }
+
+    // Final safety net: if the resulting --ink/--paper pair somehow ended up
+    // below AA (e.g. base_ink was borderline and now paper shifted), fall
+    // back entirely — an inconsistent-but-readable base beats a pretty-but-
+    // illegible blend every time.
+    let final_paper = parse_var_hex(&body, "--paper").unwrap_or((255,255,255));
+    let final_ink   = parse_var_hex(&body, "--ink").or(base_ink).unwrap_or((0,0,0));
+    if contrast_ratio(final_ink, final_paper) < 4.5 {
+        return base.clone();
+    }
+
+    Variant_Palette {
+        id:   format!("{}+blend", base.id),
+        tags: base.tags.clone(),
+        body,
+    }
+}
+
+// Alias so the blend fn doesn't need to import from variants:: at each site.
+use crate::variants::Palette as Variant_Palette;
+
 fn assemble_shell(
     theme: &Theme, palette: &Palette, sections: &[&Variant], idea: &str,
 ) -> (String, String) {
+    assemble_shell_ext(theme, palette, sections, idea, None)
+}
+
+/// Extended shell builder that honors a scraped font override for the
+/// display family — the theme's original font stays as fallback so
+/// widow characters still render if Google Fonts drops the scraped one.
+fn assemble_shell_ext(
+    theme: &Theme, palette: &Palette, sections: &[&Variant], idea: &str,
+    display_override: Option<&str>,
+) -> (String, String) {
     let fonts_meta = theme.meta.get("fonts").cloned().unwrap_or_default();
-    let display = extract_font(&fonts_meta, "display").unwrap_or_else(|| "Inter".into());
+    let theme_display = extract_font(&fonts_meta, "display").unwrap_or_else(|| "Inter".into());
+    let display = display_override
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| theme_display.clone());
     let body    = extract_font(&fonts_meta, "body").unwrap_or_else(|| "Inter".into());
     let mono    = extract_font(&fonts_meta, "mono").unwrap_or_else(|| "JetBrains Mono".into());
 
@@ -1149,7 +1806,13 @@ fn assemble_shell(
     head.push_str("*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}\n");
     head.push_str(":root{\n");
     head.push_str(&palette.body); head.push('\n');
-    head.push_str(&format!("--font-display: '{}', Georgia, serif;\n", display));
+    // Scraped display font (if any) wins; theme's original stays as fallback
+    // so text still renders if the scraped font fails to load.
+    if display != theme_display {
+        head.push_str(&format!("--font-display: '{}', '{}', Georgia, serif;\n", display, theme_display));
+    } else {
+        head.push_str(&format!("--font-display: '{}', Georgia, serif;\n", display));
+    }
     head.push_str(&format!("--font-body: '{}', -apple-system, sans-serif;\n", body));
     head.push_str(&format!("--font-mono: '{}', ui-monospace, monospace;\n", mono));
     head.push_str("}\n");
@@ -1395,13 +2058,13 @@ fn strip_tags(s: &str) -> String {
 /// Spawn a background critique. We don't block the design surface on it; the
 /// LLM sends CritiqueFixes when ready. Errors are swallowed silently — the
 /// critique is an assistive polish, not a hard requirement.
-fn spawn_critique(html: String, provider: Provider, tx: Sender<AppEvent>) {
+fn spawn_critique(html: String, mode: crate::session::Mode, provider: Provider, tx: Sender<AppEvent>) {
     tokio::spawn(async move {
-        let _ = run_critique(html, provider, tx).await;
+        let _ = run_critique(html, mode, provider, tx).await;
     });
 }
 
-async fn run_critique(html: String, provider: Provider, tx: Sender<AppEvent>) -> Result<()> {
+async fn run_critique(html: String, mode: crate::session::Mode, provider: Provider, tx: Sender<AppEvent>) -> Result<()> {
     // Cap the input HTML so the critique input stays bounded.
     let bounded = bound_html(&html, 30_000);
     let system  = ai::prompts::CRITIQUE_SYSTEM;
@@ -1409,10 +2072,11 @@ async fn run_critique(html: String, provider: Provider, tx: Sender<AppEvent>) ->
 
     // Non-streaming — critique is small (~500 tokens output). Routes through
     // the cached channel so the design-knowledge prefix is reused from the
-    // just-completed generation (same 5-minute cache window).
+    // just-completed generation (same 5-minute cache window). Uses the
+    // session's mode so the cached prefix matches the design pass.
     let stop = Arc::new(AtomicBool::new(false));
     let comp = provider.complete_streaming_cached(
-        system, ai::prompts::SYSTEM_CONTEXT, &user, 900,
+        system, ai::prompts::system_context(mode), &user, 900,
         Box::new(|_| {}),
         stop,
     ).await?;

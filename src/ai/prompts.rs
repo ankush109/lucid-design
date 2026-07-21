@@ -1,104 +1,55 @@
-/// The full design knowledge base + image toolkit + three.js toolkit. Sent as
-/// a cacheable prefix on every LLM call so Anthropic prompt caching can reuse
-/// it — the same bytes across calls are what makes caching work at all.
-pub const SYSTEM_CONTEXT: &str = concat!(
-    "=== DESIGN KNOWLEDGE ===\n",
-    include_str!("design_knowledge.md"),
+use crate::session::Mode;
+
+// ── Mode-scoped design knowledge ──
+// The KB is split so LANDING and APP calls each ship only the slice relevant
+// to their mode, cutting per-call token cost ~30-50%. Sent as a cacheable
+// prefix on every LLM call (Anthropic prompt caching reuses identical bytes
+// across calls — the smaller the mode-specific tail, the cheaper).
+
+const KB_CORE:             &str = include_str!("knowledge/core.md");
+const KB_PATTERNS_LANDING: &str = include_str!("knowledge/patterns-landing.md");
+const KB_PATTERNS_APP:     &str = include_str!("knowledge/patterns-app.md");
+const IMAGE_TOOLKIT:       &str = include_str!("knowledge/image-toolkit.md");
+const THREEJS_TOOLKIT:     &str = include_str!("knowledge/threejs.md");
+
+pub const SYSTEM_CONTEXT_LANDING: &str = concat!(
+    "=== DESIGN KNOWLEDGE (CORE) ===\n",
+    include_str!("knowledge/core.md"),
+    "\n=== DESIGN KNOWLEDGE (LANDING PATTERNS) ===\n",
+    include_str!("knowledge/patterns-landing.md"),
     "\n=== IMAGE TOOLKIT ===\n",
-    r#"
-Use these free CDN URLs — no API keys required. Choose dimensions that match
-the layout slot (hero, card, avatar). Always include descriptive alt text.
-
-1. Topical photos (keyword-tagged, Creative Commons):
-   https://loremflickr.com/{WIDTH}/{HEIGHT}/{KEYWORD1},{KEYWORD2}?lock={SEED}
-   Example (studio photography hero):
-   <img src="https://loremflickr.com/1600/900/studio,photography,camera?lock=42"
-        alt="Photographer setting up lights in a studio" />
-
-2. Deterministic random photos (topic-less but reliable):
-   https://picsum.photos/seed/{DESCRIPTIVE-SEED}/{WIDTH}/{HEIGHT}
-   Example: https://picsum.photos/seed/pricing-hero/1200/600
-
-3. User avatars (1-70, real headshot-style):
-   https://i.pravatar.cc/{SIZE}?img={1..70}
-   Example: https://i.pravatar.cc/72?img=13
-
-Image placement principles:
-- One large hero image, aspect ratio 16:9 or 3:2. Match keyword to the subject.
-- Feature cards benefit from a moment/product photo, not just an icon.
-- Testimonials use real-looking avatars via pravatar (pick different img= numbers).
-- For text over images add a scrim / gradient overlay (contrast floor 4.5:1).
-- Consistent aspect ratios across peer elements (all feature cards use 4:3, etc.).
-- Loading: reserve the image's aspect ratio in CSS so nothing shifts.
-- Never use lorem ipsum captions — write realistic ones tied to the subject.
-"#,
+    include_str!("knowledge/image-toolkit.md"),
     "\n=== THREE.JS TOOLKIT ===\n",
-    r#"
-When the design calls for a signature 3D moment — a hero with an animated
-gradient orb, a floating geometry, a particle field, a wireframe object —
-reach for three.js. Guidance below.
-
-CDN (ES module, always latest stable):
-<script type="importmap">
-{"imports": {"three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"}}
-</script>
-<script type="module">
-  import * as THREE from "three";
-  // ... your scene here ...
-</script>
-
-WHEN to use three.js:
-- Exactly ONE moment per page. Never two 3D scenes.
-- Decorative only — behind the hero, in an aside, as an ambient background.
-- If the REFERENCE SITE uses three.js/WebGL (block will call this out), you
-  MUST include a matching 3D element in the new design.
-- If the subject has depth-suggestive semantics (space, physics, VR, 3D
-  modelling tool, immersive audio), consider it even without reference cue.
-
-WHEN NOT:
-- Never for navigation, content, or anything a screen reader must access.
-- Never in a bento cell — the tiling breaks the visual metaphor.
-- Never over key text without an opacity < 0.5 layer between.
-
-MINIMAL BOILERPLATE (adapt, don't copy verbatim):
-<div id="scene" style="position:absolute;inset:0;pointer-events:none;z-index:0"></div>
-<script type="module">
-import * as THREE from "three";
-const host = document.getElementById("scene");
-const renderer = new THREE.WebGLRenderer({ alpha:true, antialias:true, powerPreference:"high-performance" });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-const resize = () => { renderer.setSize(host.clientWidth, host.clientHeight); camera.aspect = host.clientWidth/host.clientHeight; camera.updateProjectionMatrix(); };
-host.appendChild(renderer.domElement);
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(50, host.clientWidth/host.clientHeight, 0.1, 100);
-camera.position.z = 4;
-// ── your geometry / material here ──
-window.addEventListener("resize", resize); resize();
-const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-const loop = (t) => { /* animate here — but skip transform updates if `reduce` */ renderer.render(scene, camera); requestAnimationFrame(loop); };
-requestAnimationFrame(loop);
-</script>
-
-COMMON PATTERNS (write one, not all):
-1. FLOATING GRADIENT ORB — icosahedron with MeshBasicMaterial + emissive
-   glow, slow rotation + subtle scale pulse. Behind hero copy. Colours from
-   the design's palette. Compose with a subtle blur backdrop-filter.
-2. PARTICLE DRIFT — BufferGeometry with 800-1500 Points, additive blending,
-   opacity 0.3-0.5. Wind-like drift on x-axis. Use for atmosphere, not focus.
-3. WIREFRAME OBJECT — TorusKnot or Dodecahedron with a wireframe material
-   whose line weight roughly matches the design's body stroke. Slow yaw
-   rotation. Feels editorial + technical.
-4. GRADIENT PLANE — ShaderMaterial on a plane, mixing two palette colours
-   with slow noise. Reads as an animated background wash.
-
-PERFORMANCE + RESPONSIBILITY:
-- Cap devicePixelRatio at 2. Higher wastes battery.
-- Pause `requestAnimationFrame` when `document.hidden` becomes true.
-- Honour `prefers-reduced-motion` — hold the still frame, don't remove the visual entirely (the composition still needs it).
-- Never depend on user interaction to render — the initial state must look intentional at t=0.
-- The scene must survive removal — no critical content lives inside the WebGL canvas.
-"#
+    include_str!("knowledge/threejs.md"),
 );
+
+pub const SYSTEM_CONTEXT_APP: &str = concat!(
+    "=== DESIGN KNOWLEDGE (CORE) ===\n",
+    include_str!("knowledge/core.md"),
+    "\n=== DESIGN KNOWLEDGE (APP / DASHBOARD PATTERNS) ===\n",
+    include_str!("knowledge/patterns-app.md"),
+    "\n=== IMAGE TOOLKIT ===\n",
+    include_str!("knowledge/image-toolkit.md"),
+);
+
+/// Pick the right cacheable prefix for the session's mode. Ambiguous falls
+/// back to LANDING as the safe default (superset for undecided sessions).
+pub fn system_context(mode: Mode) -> &'static str {
+    match mode {
+        Mode::App => SYSTEM_CONTEXT_APP,
+        Mode::Landing | Mode::Ambiguous => SYSTEM_CONTEXT_LANDING,
+    }
+}
+
+/// Legacy alias — call sites that pre-date mode routing get the landing
+/// context. New code should use `system_context(mode)`.
+pub const SYSTEM_CONTEXT: &str = SYSTEM_CONTEXT_LANDING;
+
+// Suppress unused warnings on the split fragment consts — they're kept
+// exposed so the MCP surface (slice 5) can serve them independently.
+#[allow(dead_code)] fn _kb_touch() {
+    let _ = (KB_CORE, KB_PATTERNS_LANDING, KB_PATTERNS_APP, IMAGE_TOOLKIT, THREEJS_TOOLKIT);
+}
 
 pub const SKELETON_SYSTEM: &str = "\
 You are a senior UI/UX designer. Generate skeleton HTML pages that show \
@@ -265,6 +216,11 @@ element specific to the subject.
 - Use image tags with REAL src URLs from the IMAGE TOOLKIT matched to the subject.
 - Give top-level sections meaningful ids matching the UI type (e.g. id=\"sidebar\", \
 id=\"dashboard\", id=\"stats\" for a dashboard; id=\"projects\", id=\"about\" for a portfolio).
+- Nav-item hrefs: for dashboards, admin panels, and app UIs, each sidebar/topbar \
+nav item MUST link to a sibling page file, e.g. <a href=\"./workouts.html\">Workouts</a>, \
+<a href=\"./calendar.html\">Calendar</a>. Do NOT use href=\"#\" or href=\"#slug\" \
+for nav items — those are reserved for same-page scroll anchors on landing pages. \
+Use the item label, lowercased and hyphenated, as the filename slug.
 - Responsive; mobile is not desktop-minus.
 - Follow the ANTI-TELLS in the knowledge base.
 
@@ -272,12 +228,33 @@ Output ONLY the raw HTML. No markdown. No prose. No explanation.";
 
 pub fn skeleton_single_styled_user(
     idea: &str, theme: &str, excluded_archetypes: &str,
-    refs: &str, knowledge: &str,
+    refs: &str, knowledge: &str, initial_pages: &[String],
 ) -> String {
     let exclusion = if excluded_archetypes.trim().is_empty() {
         String::new()
     } else {
         format!("\n\nARCHETYPES ALREADY TRIED — do NOT reuse any of these: {excluded_archetypes}. Pick a genuinely different structural approach.\n")
+    };
+
+    let pages_block = if initial_pages.is_empty() {
+        String::new()
+    } else {
+        let items: Vec<String> = initial_pages.iter().map(|p| {
+            let name = p.trim();
+            let slug = name.to_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>();
+            let slug: String = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+            format!("<a href=\"./{slug}.html\">{name}</a>")
+        }).collect();
+        format!(
+            "\n\nMULTI-PAGE APP — the user has already declared these sibling pages. \
+Wire them into the sidebar/topbar nav as real anchors so the shell can be \
+inherited by later designs. Use these exact hrefs and labels:\n{}\n\
+The current (home) item should be marked active (class=\"active\" or aria-current=\"page\").\n",
+            items.join("\n")
+        )
     };
 
     format!(r#"Product idea: {idea}
@@ -287,13 +264,37 @@ Theme direction: {theme}
 Design references from the web:
 {refs}
 {knowledge}
-{exclusion}
+{exclusion}{pages_block}
 Generate ONE complete, fully-styled HTML design for "{idea}".
 
 Reading order first (numbered list of what should be seen first, second, third — internal reasoning, do NOT output this list, use it to drive the layout).
 
 Then output the HTML. Start with the archetype meta tag, then DOCTYPE, then the styled page. Include real image URLs from the IMAGE TOOLKIT matched to "{idea}". Realistic content specific to the subject.
 "#)
+}
+
+pub const NEXT_PAGES_SUGGEST_SYSTEM: &str = "\
+You are a UI information-architect. Given a product idea and the just-designed \
+home page's existing section ids, list up to 4 top-level PAGES (not in-page \
+sections) this app would plausibly have as siblings of the home page.
+
+Reply as STRICT JSON — an array of objects with `name` (human label, 1-3 words) \
+and `slug` (lowercase, hyphenated, filesystem-safe, matches [a-z0-9-]+). Do not \
+suggest a page whose slug matches any of the existing section ids you were \
+given. Do not suggest generic pages like 'home', 'index', 'landing'.
+
+Output format, exactly:
+[{\"name\":\"Workouts\",\"slug\":\"workouts\"},{\"name\":\"Calendar\",\"slug\":\"calendar\"}]
+
+No prose. No markdown fences. No trailing text. Just the JSON array.";
+
+pub fn next_pages_suggest_user(idea: &str, existing_ids: &[String]) -> String {
+    let ids = if existing_ids.is_empty() {
+        "(none)".to_string()
+    } else {
+        existing_ids.join(", ")
+    };
+    format!("Product idea: {idea}\n\nExisting section ids on the home page (do NOT resuggest these as sibling pages): {ids}\n\nList up to 4 sibling pages this app would have. JSON array only.")
 }
 
 pub const CRITIQUE_SYSTEM: &str = "\

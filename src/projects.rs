@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
+
+use crate::session::{Mode, Session};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Project {
@@ -124,6 +127,8 @@ pub fn delete(slug: &str) -> Result<()> {
     let _ = fs::remove_file(d.join(format!("{}.html", slug)));
     let _ = fs::remove_file(d.join(format!("{}.name", slug)));
     let _ = fs::remove_file(d.join(format!("{}.chat.json", slug)));
+    let _ = fs::remove_file(d.join(format!("{}.chat.jsonl", slug)));
+    let _ = fs::remove_file(d.join(format!("{}.session.json", slug)));
     let _ = fs::remove_file(d.join(format!("{}.pages.json", slug)));
     // Nuke any sub-pages ({slug}--*.html).
     if let Ok(entries) = fs::read_dir(&d) {
@@ -272,4 +277,121 @@ pub fn delete_page(project_slug: &str, page_slug: &str) -> Result<()> {
     manifest.pages.retain(|p| p.slug != page_slug);
     if manifest.active == page_slug { manifest.active = "home".into(); }
     write_pages_manifest(project_slug, &manifest)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Session persistence
+//
+// Storage:
+//   {slug}.session.json  ← serialized Session (mode, brief, active_page, tokens…)
+//   {slug}.chat.jsonl    ← structured chat log, one JSON message per line
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn session_path(project_slug: &str) -> Result<PathBuf> {
+    Ok(dir()?.join(format!("{}.session.json", project_slug)))
+}
+
+fn chat_jsonl_path(project_slug: &str) -> Result<PathBuf> {
+    Ok(dir()?.join(format!("{}.chat.jsonl", project_slug)))
+}
+
+/// Read a project's persisted session. If missing, synthesize one from the
+/// home HTML archetype so legacy projects self-upgrade with no user prompt,
+/// and write it back so the classifier only runs once per project.
+pub fn read_session(project_slug: &str) -> Result<Session> {
+    let path = session_path(project_slug)?;
+    if path.exists() {
+        let s = fs::read_to_string(&path).unwrap_or_default();
+        if let Ok(sess) = serde_json::from_str::<Session>(&s) {
+            return Ok(sess);
+        }
+    }
+    // Synthesize from the home HTML if present.
+    let mut sess = Session::default();
+    if let Ok(html) = read(project_slug) {
+        sess.mode = classify_html_mode(&html);
+    }
+    let _ = write_session(project_slug, &sess);
+    Ok(sess)
+}
+
+pub fn write_session(project_slug: &str, sess: &Session) -> Result<()> {
+    let path = session_path(project_slug)?;
+    // Atomic write: tmp + rename so a crash mid-write can't corrupt the file.
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_string_pretty(sess)
+        .unwrap_or_else(|_| "{}".into());
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Best-effort mode classifier from a rendered HTML string. `sidebar`,
+/// `dashboard`, or `admin` in the archetype meta or id/class landscape → App;
+/// otherwise → Landing (never Ambiguous — legacy projects always resolve
+/// to something concrete).
+fn classify_html_mode(html: &str) -> Mode {
+    let lower = html.to_ascii_lowercase();
+    let app_signals = [
+        "name=\"archetype\" content=\"sidebar",
+        "name=\"archetype\" content=\"dashboard",
+        "name=\"archetype\" content=\"admin",
+        "id=\"sidebar",
+        "class=\"sidebar",
+        "id=\"topbar",
+        "id=\"dashboard",
+        "class=\"dashboard",
+    ];
+    for sig in app_signals {
+        if lower.contains(sig) { return Mode::App; }
+    }
+    Mode::Landing
+}
+
+/// Append a single chat message to the JSONL log. Each line is a self-
+/// describing JSON object like `{"role":"user","kind":"text","content":"…"}`.
+/// Structure matches whatever the React store sends via the `save_chat_line`
+/// IPC — this file just persists the bytes verbatim.
+pub fn append_chat_line(project_slug: &str, json_line: &str) -> Result<()> {
+    let path = chat_jsonl_path(project_slug)?;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    // Enforce single-line-per-entry: strip embedded newlines from the payload.
+    let one_line = json_line.replace('\n', " ").replace('\r', " ");
+    writeln!(f, "{}", one_line.trim())?;
+    Ok(())
+}
+
+/// Rewrite the entire chat log from a JSON array (used when the React store
+/// mirrors its full message list — matches the legacy `save_chat` semantics
+/// but with per-line JSON so streaming reads and appends are trivial).
+pub fn overwrite_chat_from_array(project_slug: &str, json_array: &str) -> Result<()> {
+    let path = chat_jsonl_path(project_slug)?;
+    let arr: Vec<serde_json::Value> = serde_json::from_str(json_array).unwrap_or_default();
+    let tmp = path.with_extension("jsonl.tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        for entry in arr {
+            let line = serde_json::to_string(&entry).unwrap_or_default();
+            writeln!(f, "{}", line)?;
+        }
+    }
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read the chat log back as a JSON array string, one message per element.
+/// Missing file → "[]". Corrupt lines are skipped rather than failing.
+pub fn read_chat_jsonl(project_slug: &str) -> Result<String> {
+    let path = chat_jsonl_path(project_slug)?;
+    if !path.exists() { return Ok("[]".into()); }
+    let s = fs::read_to_string(&path).unwrap_or_default();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            out.push(v);
+        }
+    }
+    Ok(serde_json::to_string(&out).unwrap_or_else(|_| "[]".into()))
 }

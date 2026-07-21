@@ -30,6 +30,13 @@ pub fn estimate_tokens(chars: usize) -> u32 { ((chars + 3) / 4) as u32 }
 pub trait AiProvider: Send + Sync {
     async fn complete(&self, system: &str, user: &str, max_tokens: u32) -> Result<Completion>;
 
+    /// Returns the model actually being used, if known. For SDK providers
+    /// (anthropic, openai, gemini) this is the configured `model` since we
+    /// pass it directly. For CLI wrappers (claudecode, codex) the value is
+    /// only known once we've seen it in a streaming response. Callers use
+    /// this to update the top-bar badge as soon as the truth is available.
+    fn detected_model(&self) -> Option<String> { None }
+
     async fn complete_streaming(
         &self,
         system: &str,

@@ -25,6 +25,7 @@ impl OpenAiProvider {
 
 #[async_trait::async_trait]
 impl AiProvider for OpenAiProvider {
+    fn detected_model(&self) -> Option<String> { Some(self.model.clone()) }
     async fn complete(&self, system: &str, user: &str, max_tokens: u32) -> Result<Completion> {
         let body = json!({
             "model": self.model,

@@ -7,6 +7,7 @@ mod knowledge;
 mod pipeline;
 mod projects;
 mod scraper;
+mod session;
 mod variants;
 
 use anyhow::Result;
@@ -73,7 +74,7 @@ fn main() -> Result<()> {
     let stop_for_ipc = stop_flag.clone();
     let webview = WebViewBuilder::new()
         .with_devtools(true)
-        .with_html(include_str!("assets/ui.html"))
+        .with_html(include_str!("../frontend/dist/index.html"))
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let body = req.body();
             if let Ok(msg) = serde_json::from_str::<pipeline::IpcMessage>(body) {
@@ -151,6 +152,19 @@ fn main() -> Result<()> {
                     let value: serde_json::Value = serde_json::from_str(candidates)
                         .unwrap_or_else(|_| serde_json::json!([]));
                     serde_json::json!({"type":"page_suggestions","candidates":value})
+                }
+                pipeline::AppEvent::SessionSnapshot { mode, brief, tokens_in, tokens_out } => {
+                    serde_json::json!({
+                        "type":"session_snapshot",
+                        "mode": mode, "brief": brief,
+                        "tokens_in": tokens_in, "tokens_out": tokens_out,
+                    })
+                }
+                pipeline::AppEvent::ModeSet { mode } => {
+                    serde_json::json!({ "type":"mode_set", "mode": mode })
+                }
+                pipeline::AppEvent::ModeClarify { brief } => {
+                    serde_json::json!({ "type":"mode_clarify", "brief": brief })
                 }
                 pipeline::AppEvent::TokenUsage {
                     turn_input, turn_output,

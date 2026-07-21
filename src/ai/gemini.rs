@@ -21,6 +21,7 @@ impl GeminiProvider {
 
 #[async_trait::async_trait]
 impl AiProvider for GeminiProvider {
+    fn detected_model(&self) -> Option<String> { Some(self.model.clone()) }
     async fn complete(&self, system: &str, user: &str, max_tokens: u32) -> Result<Completion> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",

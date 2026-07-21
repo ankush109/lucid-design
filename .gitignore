@@ -1,3 +1,7 @@
 /target
 design-export-*.html
 design-prototype-*.html
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.log

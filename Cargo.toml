@@ -1,6 +1,6 @@
 [package]
 name = "lucid-design"
-version = "0.2.1"
+version = "0.5.0"
 edition = "2021"
 authors = ["Ankush Banerjee <banerjeeankush184@gmail.com>"]
 description = "Native macOS design generator — pick sections from a hand-authored variant library, LLM fills copy, swap sections zero-cost."
@@ -11,6 +11,20 @@ homepage = "https://github.com/ankush109/lucid-design"
 keywords = ["design", "ui", "llm", "webview", "macos"]
 categories = ["gui", "development-tools"]
 rust-version = "1.77"
+build = "build.rs"
+# The published crate ships the prebuilt frontend/dist/index.html so
+# downstream `cargo install` doesn't need Node. Local dev keeps the source
+# under frontend/src so `cargo build` invokes vite via build.rs.
+include = [
+  "/src/**",
+  "/build.rs",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE-APACHE",
+  "/LICENSE-MIT",
+  "/frontend/dist/index.html",
+]
 
 [package.metadata.docs.rs]
 default-target = "x86_64-apple-darwin"
