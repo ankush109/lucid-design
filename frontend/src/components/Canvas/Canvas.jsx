@@ -16,6 +16,40 @@ export default function Canvas() {
   const currentTarget     = useStore(s => s.currentTarget);
   const historyResetToken = useStore(s => s.historyResetToken);
   const kitPicker         = useStore(s => s.kitPicker);
+  const status            = useStore(s => s.status);
+  const pageTabs          = useStore(s => s.session.tabs);
+  const activePageSlug    = useStore(s => s.session.currentPage);
+  const canvasViewMode    = useStore(s => s.canvasViewMode);
+
+  // Metadata about the currently-viewed page (built / has_skeleton flags).
+  const activePageInfo = React.useMemo(
+    () => (pageTabs || []).find(p => p.slug === activePageSlug) || null,
+    [pageTabs, activePageSlug]
+  );
+  const pageMode = (activePageInfo && canvasViewMode[activePageInfo.slug])
+    || (activePageInfo && activePageInfo.built === false && activePageInfo.has_skeleton ? 'skeleton' : 'built');
+  const showViewToggle = !!activePageInfo && activePageInfo.has_skeleton && activePageInfo.built === true;
+  const showBuildCTA   = !!activePageInfo && activePageInfo.has_skeleton && activePageInfo.built === false && pageMode === 'skeleton';
+
+  function setViewMode(mode) {
+    if (!activePageInfo) return;
+    const s = useStore.getState();
+    s.setCanvasViewMode(activePageInfo.slug, mode);
+    if (mode === 'skeleton') {
+      ipcSend('get_page_skeleton', activePageInfo.slug);
+    } else if (mode === 'built') {
+      // Ask backend to switch back to built HTML.
+      ipcSend('switch_page', activePageInfo.slug);
+    }
+  }
+  function buildThisPage() {
+    if (!activePageInfo) return;
+    if (activePageInfo.slug === 'home') return;
+    const s = useStore.getState();
+    s.addUser(`Build the ${activePageInfo.name} page from its wireframe`);
+    s.setStatus('busy', `Building ${activePageInfo.name}…`);
+    ipcSend('build_page_from_skeleton', activePageInfo.slug);
+  }
 
   const frameRef = useRef(null);
   const historyRef = useRef([]);   // edit history stack
@@ -275,6 +309,36 @@ export default function Canvas() {
             </div>
           )}
           <div className="toolbar-spacer" />
+
+          {/* View-mode toggle when the current page has both a skeleton
+              and a built version. Shown to the LEFT of the device switcher
+              so it's discoverable. */}
+          {showViewToggle && (
+            <div className="canvas-view-toggle" role="tablist" aria-label="Preview mode">
+              <button
+                role="tab"
+                className={pageMode === 'skeleton' ? 'active' : ''}
+                onClick={() => setViewMode('skeleton')}
+              >Wireframe</button>
+              <button
+                role="tab"
+                className={pageMode === 'built' ? 'active' : ''}
+                onClick={() => setViewMode('built')}
+              >Built</button>
+            </div>
+          )}
+
+          {/* Prominent CTA when we're viewing a wireframe page that hasn't
+              been built yet. Kicks off build_page_from_skeleton. */}
+          {showBuildCTA && (
+            <button
+              className="build-page-cta"
+              onClick={buildThisPage}
+              disabled={status?.state === 'busy'}
+              title="Upgrade this wireframe to a full-fidelity page"
+            >Build this page →</button>
+          )}
+
           <DeviceSwitcher device={device} setDevice={setDevice} />
           <div className="tb-sep" />
           {hasDesign && (

@@ -92,6 +92,26 @@ export const useStore = create((set, get) => ({
     },
   }),
 
+  // ── Skeleton wiring ──
+  // Sent by Rust after batch skeleton generation lands. Same shape as
+  // setPages but preserved separately for the "Skeletons ready" chat pill.
+  applySkeletonsReady: (pages) => set(({ session }) => ({
+    session: { ...session, tabs: Array.isArray(pages) ? pages : session.tabs },
+    skeletonProgress: null,
+  })),
+
+  // Progress ping while the batch generator runs.
+  skeletonProgress: null,  // { current, total, page } | null
+  setSkeletonProgress: (patch) => set({ skeletonProgress: patch }),
+
+  // Canvas view mode: 'built' (page's real HTML) or 'skeleton' (wireframe
+  // fetched via get_page_skeleton). Persists across page switches; each
+  // page keeps its own preferred mode.
+  canvasViewMode: {},   // { [pageSlug]: 'built' | 'skeleton' }
+  setCanvasViewMode: (pageSlug, mode) => set(({ canvasViewMode }) => ({
+    canvasViewMode: { ...canvasViewMode, [pageSlug]: mode },
+  })),
+
   setCurrentProject: (proj) => set({
     session: { ...get().session, currentProject: proj },
     crumb: proj ? proj.name : 'new design',

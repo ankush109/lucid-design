@@ -598,6 +598,34 @@ html[data-theme="dark"] .modal-backdrop { background: rgba(0,0,0,0.55); }
 }
 .page-tab-new:hover { background: color-mix(in oklab, var(--accent) 8%, transparent); }
 
+.page-tab.wireframe {
+  border-style: dashed; color: var(--muted);
+  background: repeating-linear-gradient(45deg, transparent 0 6px, color-mix(in oklab, var(--muted) 6%, transparent) 6px 12px);
+}
+.page-tab.wireframe .wire-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  border: 1px dashed var(--muted); margin-right: 6px; vertical-align: middle;
+}
+.page-tab.wireframe.active { color: var(--ink-2); background: var(--paper); }
+
+/* ── Canvas toolbar: view-mode toggle + Build-this-page CTA ── */
+.canvas-view-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; margin-right: 8px; }
+.canvas-view-toggle button {
+  background: transparent; border: none; padding: 5px 10px; font-size: 11px;
+  color: var(--muted); cursor: pointer; letter-spacing: 0.04em; font-family: inherit;
+}
+.canvas-view-toggle button.active { background: var(--ink); color: var(--paper); }
+.canvas-view-toggle button:not(.active):hover { color: var(--ink-2); }
+
+.build-page-cta {
+  background: var(--accent); color: #fff; border: none;
+  padding: 6px 14px; border-radius: 4px; font-weight: 500;
+  cursor: pointer; letter-spacing: 0.04em; font-family: inherit;
+  transition: background 120ms ease;
+}
+.build-page-cta:hover { background: color-mix(in oklab, var(--accent) 88%, black); }
+.build-page-cta:disabled { opacity: 0.4; cursor: not-allowed; }
+
 /* ── Preview area ── */
 .preview-area {
   flex: 1; overflow: hidden;

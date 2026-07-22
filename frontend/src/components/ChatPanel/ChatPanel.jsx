@@ -102,6 +102,21 @@ export default function ChatPanel() {
       }
     }
 
+    // ── Wireframe refinement (when the active tab is showing a skeleton) ──
+    // We route to a separate IPC that rewrites the .skeleton.html file
+    // instead of the built page (which may not even exist yet).
+    const activePage = (s.session.tabs || []).find(p => p.slug === s.session.currentPage);
+    const activeMode = (s.canvasViewMode || {})[activePage?.slug]
+      || (activePage && activePage.built === false && activePage.has_skeleton ? 'skeleton' : 'built');
+    if (activePage && activeMode === 'skeleton') {
+      if (s.currentHTML) ipcSend('sync_design', s.currentHTML);
+      s.addUser(text);
+      ta.value = ''; ta.style.height = 'auto';
+      s.setStatus('busy', 'Tweaking wireframe…');
+      ipcSend('refine_skeleton', JSON.stringify({ slug: activePage.slug, prompt: text }));
+      return;
+    }
+
     // ── Normal refine ──
     if (s.currentHTML) ipcSend('sync_design', s.currentHTML);
     s.addUser(text);

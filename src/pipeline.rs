@@ -51,6 +51,13 @@ pub enum AppEvent {
     /// `start_design` classified the idea as Ambiguous and needs the user to
     /// pick Landing or App via the clarify picker.
     ModeClarify { brief: String },
+    /// Batch skeleton generation finished — the payload is a JSON array of
+    /// {slug, name, built, has_skeleton} entries so the UI can refresh its
+    /// tab bar with skeleton dashes for un-built pages.
+    SkeletonsReady { pages: String },
+    /// Progress ping during batch skeleton generation. Lets the user see
+    /// "Wireframing 2 of 4: Workouts…" instead of a silent wait.
+    SkeletonProgress { current: u32, total: u32, page: String },
     TokenUsage {
         turn_input:     u32,
         turn_output:    u32,
@@ -268,12 +275,101 @@ pub async fn run(
             }
 
             "save_chat" => {
-                if let Some(ref slug) = current_project {
-                    // React sends the entire messages array as JSON. Persist
-                    // as JSONL for streaming reads/appends. Keep legacy
-                    // .chat.json in sync as well until a future PR removes it.
-                    let _ = projects::overwrite_chat_from_array(slug, &msg.content);
-                    let _ = projects::write_chat(slug, &msg.content);
+                if let Some(ref cur_slug) = current_project {
+                    // Payload shapes (backwards-compatible):
+                    //   NEW: {"slug":"…","chat":[…]}  → verify slug then write
+                    //   OLD: "[…]" (raw array string)  → assume current_project
+                    // The NEW shape prevents a stale debounced save from an
+                    // outgoing project clobbering an incoming project's chat.
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&msg.content).unwrap_or(serde_json::Value::Null);
+                    let (target_slug, chat_json) = match parsed.get("slug").and_then(|v| v.as_str()) {
+                        Some(s) => {
+                            let chat = parsed.get("chat")
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "[]".into());
+                            (Some(s.to_string()), chat)
+                        }
+                        None => (None, msg.content.clone()),
+                    };
+                    if let Some(ref t) = target_slug {
+                        if t != cur_slug {
+                            // Stale save from a project we've since switched
+                            // away from — drop silently rather than corrupt.
+                            continue;
+                        }
+                    }
+                    let _ = projects::overwrite_chat_from_array(cur_slug, &chat_json);
+                    let _ = projects::write_chat(cur_slug, &chat_json);
+                }
+                continue;
+            }
+
+            "refine_skeleton" => {
+                // Chat refinement while viewing a wireframe. Rewrites the
+                // page's skeleton HTML in place (never touches the built
+                // version, which the user still hasn't upgraded to).
+                let payload: serde_json::Value = serde_json::from_str(&msg.content)
+                    .unwrap_or(serde_json::Value::Null);
+                let target = payload["slug"].as_str().unwrap_or("").trim().to_string();
+                let prompt = payload["prompt"].as_str().unwrap_or("").trim().to_string();
+                let slug = match &current_project { Some(s) => s.clone(), None => continue };
+                if target.is_empty() || prompt.is_empty() { continue; }
+                let existing = match projects::read_skeleton(&slug, &target) {
+                    Ok(s) => s, Err(_) => continue,
+                };
+
+                stop_flag.store(false, Ordering::SeqCst);
+                let _ = tx.send(AppEvent::SetGenerating(true));
+                let _ = tx.send(AppEvent::StatusUpdate(
+                    format!("Tweaking {} wireframe…", target)
+                ));
+
+                let system = SKELETON_REFINE_SYSTEM;
+                let user   = format!(
+                    "Current wireframe HTML:\n{}\n\nUser tweak: {}\n\n\
+                    Return the full updated wireframe HTML. Keep it a wireframe \
+                    (grayscale, boxes, dashed placeholders) — DO NOT add real \
+                    styling. No prose. No markdown fences.",
+                    bound_html(&existing, 20_000), prompt
+                );
+                let comp = stream_generate(
+                    &provider, crate::session::Mode::App,
+                    system, &user, 8_000, &tx, stop_flag.clone(),
+                ).await;
+                let _ = tx.send(AppEvent::SetGenerating(false));
+                match comp {
+                    Ok(c) => {
+                        let new_html = c.text.trim().to_string();
+                        if !new_html.is_empty() && new_html.to_ascii_lowercase().contains("<html") {
+                            let usage = usage_or_estimate(c.usage, system, &user, &new_html);
+                            let _ = projects::write_skeleton(&slug, &target, &new_html);
+                            emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                            refresh_model(&tx, &mut current_model);
+                            let _ = tx.send(AppEvent::DesignUpdate(new_html));
+                            let _ = tx.send(AppEvent::AssistantMessage(
+                                format!("Wireframe updated. Hit \"Build this page\" when you're happy with the layout.")
+                            ));
+                        } else {
+                            let _ = tx.send(AppEvent::AssistantMessage(
+                                "Couldn't refine the wireframe — please try a more specific tweak.".into()
+                            ));
+                        }
+                    }
+                    Err(_) => {}
+                }
+                continue;
+            }
+
+            "get_page_skeleton" => {
+                // Sends the skeleton HTML for the currently-viewed page as a
+                // DesignUpdate (viewer-only — doesn't touch state). Used by
+                // the Wireframe / Built toggle in the canvas toolbar.
+                let target = msg.content.trim().to_string();
+                let slug = match &current_project { Some(s) => s.clone(), None => continue };
+                let page = if target.is_empty() { current_page.clone() } else { target };
+                if let Ok(html) = projects::read_skeleton(&slug, &page) {
+                    let _ = tx.send(AppEvent::DesignUpdate(html));
                 }
                 continue;
             }
@@ -295,8 +391,15 @@ pub async fn run(
                 current_page = target.clone();
                 let _ = projects::set_active_page(&slug, &target);
 
+                // Preference order: built page → skeleton → empty. The tab
+                // bar shows the skeleton state via manifest.has_skeleton so
+                // the user knows which one is being previewed.
                 let html = if target == "home" {
                     projects::read(&slug).unwrap_or_default()
+                } else if projects::has_built_page(&slug, &target) {
+                    projects::read_page(&slug, &target).unwrap_or_default()
+                } else if projects::has_skeleton(&slug, &target) {
+                    projects::read_skeleton(&slug, &target).unwrap_or_default()
                 } else {
                     projects::read_page(&slug, &target).unwrap_or_default()
                 };
@@ -312,6 +415,117 @@ pub async fn run(
                 };
                 let _ = tx.send(AppEvent::DesignUpdate(html));
                 push_pages(&tx, &slug);
+                continue;
+            }
+
+            "build_page_from_skeleton" => {
+                let target = msg.content.trim().to_string();
+                let slug = match &current_project { Some(s) => s.clone(), None => continue };
+                if target.is_empty() { continue; }
+                let manifest = projects::read_pages_manifest(&slug).unwrap_or_default();
+                let page_info = match manifest.pages.iter().find(|p| p.slug == target) {
+                    Some(p) => p.clone(), None => continue,
+                };
+                let skeleton_hint = projects::read_skeleton(&slug, &target).ok();
+                let brief = skeleton_hint
+                    .map(|s| format!(
+                        "The wireframe for reference (shows structural intent):\n{}",
+                        bound_html(&s, 8_000)
+                    ))
+                    .unwrap_or_default();
+
+                stop_flag.store(false, Ordering::SeqCst);
+                let _ = tx.send(AppEvent::SetGenerating(true));
+                let _ = tx.send(AppEvent::StatusUpdate(
+                    format!("Building {}…", page_info.name)
+                ));
+
+                let name_display = page_info.name.clone();
+                let project_display = projects::name_of(&slug).unwrap_or_default();
+
+                // Two paths:
+                //  · home OR home isn't built yet → full generation from
+                //    scratch using handle_start_design with the skeleton as
+                //    brief hint. This establishes the design system.
+                //  · sub-page after home built → handle_new_page inherits
+                //    the home shell for consistency.
+                let idea_for_build = if brief.is_empty() {
+                    project_display.clone()
+                } else {
+                    format!("{project_display}\n\n{brief}")
+                };
+                let home_exists = projects::has_built_page(&slug, "home");
+                let result = if target == "home" || !home_exists {
+                    handle_start_design(
+                        &idea_for_build, "auto", &[], &[], crate::session::Mode::App,
+                        &provider, &tx, stop_flag.clone(), &knowledge,
+                    ).await.map(|(state, usage)| {
+                        let html = match state {
+                            State::Refining { current, .. } => current,
+                            _ => String::new(),
+                        };
+                        (html, usage)
+                    })
+                } else {
+                    let home_html = projects::read(&slug).unwrap_or_default();
+                    handle_new_page(
+                        &project_display, &name_display, &brief, &home_html,
+                        &provider, &tx, stop_flag.clone(),
+                    ).await
+                };
+
+                let _ = tx.send(AppEvent::SetGenerating(false));
+                match result {
+                    Ok((built_html, usage)) => {
+                        // home lands at {slug}.html; sub-pages at {slug}--{page}.html
+                        if target == "home" {
+                            let _ = projects::write(&slug, &built_html);
+                        } else {
+                            let _ = projects::write_page(&slug, &target, &built_html);
+                        }
+                        // Mark this page as built in the manifest.
+                        if let Ok(mut m) = projects::read_pages_manifest(&slug) {
+                            if let Some(p) = m.pages.iter_mut().find(|p| p.slug == target) {
+                                p.built = true;
+                            }
+                            m.active = target.clone();
+                            let _ = projects::write_pages_manifest(&slug, &m);
+                        }
+                        current_page = target.clone();
+                        state = State::Refining {
+                            current: built_html.clone(),
+                            idea: project_display.clone(),
+                            theme: String::new(),
+                            tried_archetypes: Vec::new(),
+                        };
+                        emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                        refresh_model(&tx, &mut current_model);
+                        let _ = tx.send(AppEvent::DesignUpdate(built_html));
+                        let _ = tx.send(AppEvent::AssistantMessage(
+                            format!("Built the {name_display} page. Toggle to the wireframe from the canvas toolbar anytime.")
+                        ));
+                        push_pages(&tx, &slug);
+
+                        // After building, offer the remaining wireframes as
+                        // chips so the user picks the next one to build.
+                        if let Ok(m) = projects::read_pages_manifest(&slug) {
+                            let remaining: Vec<serde_json::Value> = m.pages.iter()
+                                .filter(|p| p.slug != "home" && !p.built && p.has_skeleton)
+                                .map(|p| serde_json::json!({ "slug": p.slug, "name": p.name }))
+                                .collect();
+                            if !remaining.is_empty() {
+                                let json = serde_json::to_string(&remaining).unwrap_or_else(|_| "[]".into());
+                                let _ = tx.send(AppEvent::PageSuggestions { candidates: json });
+                            }
+                        }
+                    }
+                    Err(e) if e.to_string() == "__stopped__" => {}
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::AssistantMessage(
+                            format!("Couldn't build {name_display}: {e}")
+                        ));
+                    }
+                }
                 continue;
             }
 
@@ -438,6 +652,64 @@ pub async fn run(
                 stop_flag.store(false, Ordering::SeqCst);
                 let _ = tx.send(AppEvent::SetGenerating(true));
 
+                // ── APP mode: skeleton-first fork ─────────────────────────
+                // Skip the full-fidelity home build. Generate wireframes for
+                // EVERY page (home + declared/inferred siblings) so the user
+                // can review the whole app's structure, tweak any wireframe
+                // via chat, and pick which one to upgrade first.
+                if current_mode == crate::session::Mode::App {
+                    let slug = current_project.clone();
+                    if slug.is_none() {
+                        let _ = tx.send(AppEvent::AssistantMessage(
+                            "Create a project first, then describe the app.".into()
+                        ));
+                        let _ = tx.send(AppEvent::SetGenerating(false));
+                        continue;
+                    }
+                    let slug = slug.unwrap();
+
+                    let declared = initial_pages.clone();
+                    let names = if !declared.is_empty() {
+                        declared
+                    } else {
+                        // Infer 4-5 typical pages for this idea. No home HTML
+                        // exists yet — the LLM works from the brief alone.
+                        suggest_pages_from_brief(&provider, &idea).await
+                    };
+
+                    let result = handle_app_skeleton_phase(
+                        &slug, &idea, &names,
+                        &provider, &tx, stop_flag.clone(),
+                    ).await;
+                    let _ = tx.send(AppEvent::SetGenerating(false));
+
+                    match result {
+                        Ok((home_skeleton, usage)) => {
+                            emit_usage(&tx, usage, &mut session_input, &mut session_output);
+                            refresh_model(&tx, &mut current_model);
+                            persist_session(&slug, current_mode, &idea, "home", &[], session_input, session_output);
+                            state = State::Refining {
+                                current: home_skeleton.clone(),
+                                idea:    idea.clone(),
+                                theme:   String::new(),
+                                tried_archetypes: Vec::new(),
+                            };
+                            current_page = "home".to_string();
+                            let _ = tx.send(AppEvent::DesignUpdate(home_skeleton));
+                            let _ = tx.send(AppEvent::AssistantMessage(
+                                "Wireframed the whole app. Click any tab to preview — tweak the wireframe via chat, or hit \"Build this page\" to upgrade to full fidelity.".into()
+                            ));
+                        }
+                        Err(e) if e.to_string() == "__stopped__" => {}
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::AssistantMessage(
+                                format!("Couldn't wireframe the app: {}\n\nTry again.", e)
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
                 let result = handle_start_design(
                     &idea, &theme, &[], &initial_pages, current_mode,
                     &provider, &tx, stop_flag.clone(), &knowledge,
@@ -470,6 +742,11 @@ pub async fn run(
                         if let State::Refining { current, .. } = &state {
                             spawn_critique(current.clone(), current_mode, provider.clone(), tx.clone());
                         }
+
+                        // Note: APP-mode skeleton generation runs BEFORE
+                        // reaching this point, via the skeleton-first fork
+                        // above. This success branch only handles LANDING
+                        // mode now, so no auto-skeleton spawn here.
                     }
                     Err(e) if e.to_string() == "__stopped__" => {}
                     Err(e) => {
@@ -1048,6 +1325,22 @@ fn push_projects_list(tx: &Sender<AppEvent>) {
     let _ = tx.send(AppEvent::ProjectsList(json));
 }
 
+/// System prompt for tweaking an existing wireframe. Kept adjacent to the
+/// handler so the whole feature is easy to trace.
+const SKELETON_REFINE_SYSTEM: &str = "\
+You are refining an existing wireframe HTML document. Apply the user's tweak \
+and return the FULL updated document. \n\n\
+Rules:\n\
+- KEEP the wireframe aesthetic: grayscale only, 1px solid gray borders, \
+dashed placeholders for media/images (`class=\"wf-box dashed\"`), `.wireframe` \
+wrapper class, `color:#555`, no color, no shadows, no gradients.\n\
+- Preserve the home page shell (sidebar, topbar, nav, footer) so the wireframe \
+still feels like part of the same app.\n\
+- The user's tweak targets the workspace region — add/remove/reorder wireframe \
+boxes as requested, but don't upgrade any part to full fidelity.\n\
+- Preserve the `<meta name=\"page-mode\" content=\"skeleton\">` tag.\n\
+Output ONLY the raw HTML. No prose. No markdown fences.";
+
 async fn stream_generate(
     provider: &Provider, mode: crate::session::Mode,
     system: &str, user: &str, max_tokens: u32,
@@ -1140,22 +1433,41 @@ async fn handle_start_design(
     let excluded = tried.join(", ");
     let system = ai::prompts::SKELETON_SINGLE_STYLED_SYSTEM;
     let user   = ai::prompts::skeleton_single_styled_user(idea, theme, &excluded, &combined_refs, &knowledge.prompt_context(), initial_pages);
-    let comp = stream_generate(provider, mode, system, &user, 8000, tx, stop).await?;
+    let comp = stream_generate(provider, mode, system, &user, 8000, tx, stop.clone()).await?;
     let usage = usage_or_estimate(comp.usage, system, &user, &comp.text);
 
     let archetype = extract_archetype(&comp.text).unwrap_or_else(|| "unknown".into());
     let mut all_tried = tried.to_vec();
     if !all_tried.contains(&archetype) { all_tried.push(archetype.clone()); }
 
-    let _ = tx.send(AppEvent::DesignUpdate(comp.text.clone()));
+    // ── Orchestrator: auto-quality pass ───────────────────────────────
+    // Run the Critic → Refiner loop BEFORE the DesignUpdate lands, so the
+    // user sees the polished version, not the raw one. Any leftover
+    // critique items surface as clickable "polish" chips.
+    let octx = crate::orchestrator::OrchestratorCtx {
+        brief:    idea,
+        mode,
+        provider,
+        tx,
+        stop:     stop.clone(),
+    };
+    let (final_html, remaining) =
+        crate::orchestrator::auto_quality_pass(&octx, comp.text, 1).await;
+
+    let _ = tx.send(AppEvent::DesignUpdate(final_html.clone()));
     let _ = tx.send(AppEvent::AssistantMessage(format!(
         "Design ready — {} layout. Edit directly on the canvas, refine here, or ask for a different layout.",
         archetype
     )));
+    // Publish any not-auto-applied critic items as polish chips.
+    if !remaining.is_empty() {
+        let json = serde_json::to_string(&remaining).unwrap_or_else(|_| "[]".into());
+        let _ = tx.send(AppEvent::CritiqueFixes(json));
+    }
 
     Ok((
         State::Refining {
-            current: comp.text,
+            current: final_html,
             idea:    idea.to_string(),
             theme:   theme.to_string(),
             tried_archetypes: all_tried,
@@ -1212,6 +1524,14 @@ async fn handle_refine_element(
         return Err(anyhow::anyhow!("empty replacement returned"));
     }
 
+    // Guard against the LLM returning a full HTML document (happens when the
+    // user's request is broad like "change the design"). If we see doctype
+    // or html/body tags at the top level, try to extract the intended
+    // element by matching the outer_html's opening tag; if we can't find a
+    // clean match, refuse to splice — full-page rewrite via element-scoped
+    // edit is exactly the bug we're preventing.
+    let new_element = sanitize_element_replacement(&new_element, outer_html)?;
+
     let refined = match splice_element(current, outer_html, &new_element) {
         Some(s) => s,
         None => {
@@ -1251,6 +1571,92 @@ fn splice_element(current: &str, outer_html: &str, replacement: &str) -> Option<
     out.push_str(replacement);
     out.push_str(&current[pos + anchor.len()..]);
     Some(out)
+}
+
+/// The element-refine LLM sometimes returns a full HTML document when the
+/// user's prompt is broad. Detect that case and either extract the intended
+/// element by matching the anchor's opening tag, or bail with a clear error
+/// so we don't accidentally splice `<!DOCTYPE …><html>…</html>` into the
+/// middle of the page.
+fn sanitize_element_replacement(raw: &str, anchor_outer: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let lower   = trimmed.to_ascii_lowercase();
+    let looks_full_doc =
+        lower.starts_with("<!doctype")
+        || lower.contains("<html")
+        || lower.contains("<body")
+        || lower.contains("<head");
+    if !looks_full_doc { return Ok(trimmed.to_string()); }
+
+    // Try to extract the intended element by matching the anchor's opening
+    // tag inside the returned document. E.g. anchor starts with
+    // `<section id="hero"` → find the first `<section` in raw and grab its
+    // outer HTML by tag-depth counting.
+    let anchor_tag = anchor_opening_tag(anchor_outer)
+        .ok_or_else(|| anyhow::anyhow!("element edit failed: couldn't parse anchor tag"))?;
+
+    if let Some(slice) = extract_first_element(trimmed, &anchor_tag) {
+        return Ok(slice);
+    }
+
+    // Couldn't recover — refuse to splice so we don't corrupt the page.
+    Err(anyhow::anyhow!(
+        "element edit refused: model returned a full HTML document instead of a \
+         single element. Try a more specific instruction like 'make the button \
+         teal' rather than 'change the design'."
+    ))
+}
+
+/// Read the opening tag name from an outer HTML string. `<section id="hero">…</section>` → `section`.
+fn anchor_opening_tag(outer: &str) -> Option<String> {
+    let s = outer.trim_start();
+    if !s.starts_with('<') { return None; }
+    let end = s[1..].find(|c: char| !c.is_ascii_alphanumeric() && c != '-')?;
+    let tag = &s[1..1+end];
+    if tag.is_empty() { None } else { Some(tag.to_ascii_lowercase()) }
+}
+
+/// Find the first `<tag …>…</tag>` in `haystack`, matching balanced open/close
+/// counts so nested same-tag children don't fool the extraction.
+fn extract_first_element(haystack: &str, tag: &str) -> Option<String> {
+    let open_pat  = format!("<{}", tag);
+    let close_pat = format!("</{}", tag);
+    let lower = haystack.to_ascii_lowercase();
+    // Locate the outermost start.
+    let start = lower.find(&open_pat)?;
+    // Confirm it's really an opening tag boundary (not `<sectionX` etc.).
+    let after = haystack.as_bytes().get(start + open_pat.len()).copied();
+    if let Some(c) = after {
+        if c.is_ascii_alphanumeric() { return None; }
+    }
+    // Walk forward, counting depth.
+    let mut depth: i32 = 0;
+    let mut cursor = start;
+    loop {
+        let rest = &lower[cursor..];
+        let next_open  = rest.find(&open_pat).map(|i| cursor + i);
+        let next_close = rest.find(&close_pat).map(|i| cursor + i);
+        match (next_open, next_close) {
+            (Some(o), Some(c)) if o < c => {
+                depth += 1;
+                cursor = o + open_pat.len();
+            }
+            (_, Some(c)) => {
+                depth -= 1;
+                if depth == 0 {
+                    // find the '>' that closes this close-tag
+                    let close_end = haystack[c..].find('>')? + c + 1;
+                    return Some(haystack[start..close_end].to_string());
+                }
+                cursor = c + close_pat.len();
+            }
+            (Some(o), None) => {
+                depth += 1;
+                cursor = o + open_pat.len();
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn bound_html(html: &str, max_chars: usize) -> String {
@@ -1357,11 +1763,30 @@ PLACEHOLDER rules:\n\
 - Feature titles: 2-4 words, concrete product noun.\n\
 - Use realistic email placeholders (e.g. \"you@studio.co\").\n\
 - Copy tone should feel drawn from the reference sites — not copied, but same register.\n\n\
-TWEAK rules (each tweak is a CSS value, kept short so it drops into a :root block):\n\
+TWEAK rules (each tweak is short — either a CSS value or a name from a fixed vocabulary):\n\
 - radius: corner rounding shared across cards/buttons. Pick between \"2px\" (brutalist/technical), \"4-6px\" (editorial/minimal), \"10-16px\" (playful/warm), \"999px\" (soft). Match the vibe of the theme AND the scraped refs.\n\
 - shadow: box-shadow for elevated cards. Should feel consistent with the palette — cool palettes get bluish shadows, warm palettes get warm-brown shadows.\n\
-- section_gap: vertical padding between sections. Denser subjects (SaaS, dashboards, admin) → 64-80px. Editorial / luxury → 120-160px.\n\n\
-Only these three tweak keys. All required. No prose. No markdown fences. Just the JSON object.";
+- section_gap: vertical padding between sections. Denser subjects (SaaS, dashboards, admin) → 64-80px. Editorial / luxury → 120-160px.\n\
+- motion: ONE signature animation to activate on the hero. MUST be exactly one from these lists, matched to the subject + theme:\n\
+    CSS/JS motions:\n\
+    · hero-float: soft/luxury/warm/editorial — hero image or headline gently floats.\n\
+    · text-stagger: editorial/luxury — hero headline reveals word-by-word (requires words wrapped in <span>).\n\
+    · gradient-shift: playful/tech — hero background gradient slowly shifts hue.\n\
+    · line-underline: minimal/editorial — an accent underline draws under the primary CTA.\n\
+    · marquee-trust: SaaS/consumer — logo or testimonial row scrolls horizontally forever.\n\
+    · parallax-hero: editorial/luxury/travel — hero image translates at 0.4× scroll speed.\n\
+    · noise-grain: editorial/luxury/premium — subtle SVG grain on the hero.\n\
+    · magnetic-cta: playful/tech — primary CTA follows the cursor slightly.\n\
+    · orbit-badge: playful/tech — a small decorative badge orbits the hero focal (requires an element with class \"orbit\").\n\
+    3D scenes (pick these when the subject warrants a WOW moment — SaaS, tech, luxury, premium, cosmic, developer, spatial):\n\
+    · 3d-orb-glow: wireframe icosahedron behind the hero, gently rotates + pulses. Great default for tech / SaaS / spatial subjects.\n\
+    · 3d-particle-drift: 1200 accent-colored particles drifting slowly — atmosphere. Editorial / creative / abstract.\n\
+    · 3d-wireframe: rotating wireframe torus knot — technical / developer / infrastructure.\n\
+    · 3d-gradient-plane: animated shader gradient wash — playful / creative / consumer.\n\
+    · 3d-star-field: starfield rotating slowly — cosmic / space / dark-mode / premium.\n\
+    · 3d-flowing-lines: eight thin curved ribbons flowing horizontally — luxury / motion / dance / music.\n\
+    · none: for extreme minimal/brutalist themes where any motion is a distraction.\n\n\
+Use 3D at MOST once per page and only when it adds genuine signature — don't force it on a matrimony or bakery site. All four tweak keys required. No prose. No markdown fences. Just the JSON object.";
 
     let user = format!(
         "Subject: {idea}\nTone package: {theme_id}{refs_prompt_block}\n\nFill these placeholder keys with concrete values suitable for \"{idea}\":\n\n{}\n\nReturn a JSON object with `placeholders` (every key above must appear once) and `tweaks` (radius, shadow, section_gap).",
@@ -1375,7 +1800,7 @@ Only these three tweak keys. All required. No prose. No markdown fences. Just th
         ai::prompts::system_context(crate::session::Mode::Landing),
         &user, 3500,
         Box::new(|_| {}),
-        stop,
+        stop.clone(),
     ).await?;
     let comp = ai::Completion { text: ai::clean(comp.text), usage: comp.usage };
     let usage = usage_or_estimate(comp.usage, system, &user, &comp.text);
@@ -1397,11 +1822,28 @@ Only these three tweak keys. All required. No prose. No markdown fences. Just th
     // rest of the pipeline sees a single Palette carrying every override.
     let final_palette = apply_style_tweaks(palette, &tweaks);
 
+    // Signature motion (LLM's pick) rides on the <body> as a data attribute
+    // that the motion CSS/JS keys on. Whitelist against the known set.
+    let motion_pick = tweaks.get("motion").cloned().unwrap_or_default();
+    let allowed = ["hero-float","text-stagger","gradient-shift","line-underline",
+                   "marquee-trust","parallax-hero","noise-grain","magnetic-cta",
+                   "orbit-badge",
+                   "3d-orb-glow","3d-particle-drift","3d-wireframe",
+                   "3d-gradient-plane","3d-star-field","3d-flowing-lines",
+                   "none"];
+    let signature_motion = if allowed.contains(&motion_pick.as_str()) && motion_pick != "none" {
+        Some(motion_pick.as_str())
+    } else { None };
+
     // ── Progressive assembly reveal ──
     // Instead of showing the completed HTML in one flash, add sections one at
     // a time to the preview iframe. Each step is a full HTML snapshot with a
     // growing <body>. Small delays make the build feel intentional.
     let (shell_open, shell_close) = assemble_shell_ext(theme, &final_palette, &selected, idea, scraped_font.as_deref());
+    // Inject the signature-motion attribute onto <body>.
+    let shell_open = if let Some(m) = signature_motion {
+        shell_open.replace("<body>\n", &format!("<body data-signature-motion=\"{}\">\n", m))
+    } else { shell_open };
     // Frame 0: empty styled shell — user sees the palette + typography land.
     let empty = format!("{shell_open}{shell_close}");
     let _ = tx.send(AppEvent::AssemblyPreview(empty.clone()));
@@ -1425,17 +1867,34 @@ Only these three tweak keys. All required. No prose. No markdown fences. Just th
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    // Final: real DesignUpdate that touches state/history/pill.
-    let html = format!("{shell_open}{body_acc}{shell_close}");
-    let _ = tx.send(AppEvent::DesignUpdate(html.clone()));
+    // Progressive-assembly reveal is done. Now run the orchestrator's
+    // auto-quality pass BEFORE the final DesignUpdate so any high-severity
+    // fixes are baked in silently; remaining critique items become polish
+    // chips the user can click.
+    let assembled = format!("{shell_open}{body_acc}{shell_close}");
+    let octx = crate::orchestrator::OrchestratorCtx {
+        brief:    idea,
+        mode:     crate::session::Mode::Landing,
+        provider,
+        tx,
+        stop:     stop.clone(),
+    };
+    let (final_html, remaining) =
+        crate::orchestrator::auto_quality_pass(&octx, assembled, 1).await;
+
+    let _ = tx.send(AppEvent::DesignUpdate(final_html.clone()));
     let _ = tx.send(AppEvent::AssistantMessage(format!(
         "Assembled from {} sections. Click any section on the canvas — a ↻ swap panel opens on the left for zero-token variant swaps.",
         selected.len()
     )));
+    if !remaining.is_empty() {
+        let json = serde_json::to_string(&remaining).unwrap_or_else(|_| "[]".into());
+        let _ = tx.send(AppEvent::CritiqueFixes(json));
+    }
 
     Ok((
         State::Refining {
-            current: html,
+            current: final_html,
             idea:    idea.to_string(),
             theme:   theme_id.to_string(),
             tried_archetypes: Vec::new(),
@@ -1823,14 +2282,417 @@ fn assemble_shell_ext(
         head.push_str(&v.style);
         head.push('\n');
     }
-    head.push_str("@keyframes fadeInUp{from{opacity:0;transform:translateY(16px);}to{opacity:1;transform:translateY(0);}}\n");
-    head.push_str("section,nav,footer{animation:fadeInUp 0.4s ease-out both;}\n");
-    head.push_str("@media (prefers-reduced-motion: reduce){section,nav,footer{animation:none;}}\n");
+    head.push_str(MOTION_CSS);
     head.push_str("</style>\n</head>\n<body>\n");
+    head.push_str(MOTION_JS);
+    head.push_str(THREEJS_LIBRARY);
 
     let tail = String::from("</body>\n</html>\n");
     (head, tail)
 }
+
+/// Base motion CSS — scroll-triggered reveals (initial state + `.motion-in`),
+/// plus a small named library of signature moves that get activated by setting
+/// `data-signature-motion="…"` on the body (LLM's choice, one per page).
+const MOTION_CSS: &str = r#"
+/* ── Scroll-reveal base ── */
+section, nav, footer, header, aside, main, article {
+  opacity: 0;
+  transform: translateY(28px);
+  transition:
+    opacity 0.7s cubic-bezier(0.16,1,0.3,1),
+    transform 0.7s cubic-bezier(0.16,1,0.3,1);
+  will-change: opacity, transform;
+}
+section.motion-in, nav.motion-in, footer.motion-in,
+header.motion-in, aside.motion-in, main.motion-in, article.motion-in {
+  opacity: 1; transform: translateY(0);
+}
+/* Nested reveals — direct children of the first hero-like section get a
+   subtle stagger without the LLM having to think about it. */
+section:first-of-type.motion-in > * {
+  animation: staggerIn 0.7s cubic-bezier(0.16,1,0.3,1) both;
+}
+section:first-of-type.motion-in > *:nth-child(2){ animation-delay: 90ms; }
+section:first-of-type.motion-in > *:nth-child(3){ animation-delay: 180ms; }
+section:first-of-type.motion-in > *:nth-child(4){ animation-delay: 270ms; }
+section:first-of-type.motion-in > *:nth-child(5){ animation-delay: 360ms; }
+@keyframes staggerIn {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Signature motions (one active per page via body[data-signature-motion]) ── */
+
+/* hero-float: gentle 6s Y-float on the first h1 or hero image */
+body[data-signature-motion="hero-float"] section:first-of-type :is(h1, img, .hero-visual, .hero-img) {
+  animation: heroFloat 6s ease-in-out infinite;
+}
+@keyframes heroFloat {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-10px); }
+}
+
+/* text-stagger: word-by-word reveal on the hero h1 (needs LLM to wrap words in spans) */
+body[data-signature-motion="text-stagger"] section:first-of-type h1 span {
+  display: inline-block;
+  opacity: 0; transform: translateY(20px);
+  animation: wordIn 0.9s cubic-bezier(0.16,1,0.3,1) both;
+}
+@keyframes wordIn { to { opacity: 1; transform: translateY(0); } }
+
+/* gradient-shift: slow hue rotation on the hero background */
+body[data-signature-motion="gradient-shift"] section:first-of-type {
+  background-size: 200% 200%;
+  animation: gradientShift 18s ease-in-out infinite;
+}
+@keyframes gradientShift {
+  0%, 100% { background-position: 0% 50%; }
+  50%      { background-position: 100% 50%; }
+}
+
+/* line-underline: accent underline draws in on the primary CTA */
+body[data-signature-motion="line-underline"] section:first-of-type a[href]:first-of-type,
+body[data-signature-motion="line-underline"] section:first-of-type button:first-of-type {
+  position: relative;
+}
+body[data-signature-motion="line-underline"] section:first-of-type a[href]:first-of-type::after,
+body[data-signature-motion="line-underline"] section:first-of-type button:first-of-type::after {
+  content: '';
+  position: absolute; left: 6%; right: 6%; bottom: -6px; height: 2px;
+  background: var(--accent);
+  transform-origin: left center;
+  animation: lineDraw 1.2s cubic-bezier(0.16,1,0.3,1) 0.4s both;
+}
+@keyframes lineDraw {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+/* marquee-trust: horizontal loop for logo/testimonial rows tagged with .marquee */
+.marquee {
+  overflow: hidden; -webkit-mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+          mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+}
+.marquee-inner { display: inline-flex; gap: 48px; animation: marqueeSlide 26s linear infinite; }
+@keyframes marqueeSlide { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+/* parallax-hero: hero image translates half the scroll distance (JS driven) */
+body[data-signature-motion="parallax-hero"] section:first-of-type :is(img, .hero-img) {
+  will-change: transform;
+}
+
+/* noise-grain: subtle SVG noise overlay on the whole hero */
+body[data-signature-motion="noise-grain"] section:first-of-type {
+  position: relative;
+}
+body[data-signature-motion="noise-grain"] section:first-of-type::before {
+  content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 1; opacity: 0.06;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0'/></filter><rect width='240' height='240' filter='url(%23n)'/></svg>");
+  mix-blend-mode: overlay;
+}
+
+/* magnetic-cta: primary CTA follows cursor slightly (JS driven) */
+body[data-signature-motion="magnetic-cta"] section:first-of-type :is(a[href], button):first-of-type {
+  transition: transform 0.2s cubic-bezier(0.16,1,0.3,1);
+  will-change: transform;
+}
+
+/* orbit-badge: floating decorative badge orbits the hero focal (LLM adds .orbit el) */
+body[data-signature-motion="orbit-badge"] .orbit {
+  animation: orbit 24s linear infinite;
+  transform-origin: -80px center;
+}
+@keyframes orbit { to { transform: rotate(360deg); } }
+
+/* Respect user preference */
+@media (prefers-reduced-motion: reduce) {
+  section, nav, footer, header, aside, main, article {
+    opacity: 1 !important; transform: none !important; transition: none !important;
+  }
+  body[data-signature-motion] * { animation: none !important; }
+}
+"#;
+
+/// three.js scene library — six pre-authored signature scenes, injected into
+/// the hero when the LLM picks a `3d-*` signature-motion. The container is
+/// absolute-positioned behind the hero content with pointer-events:none so
+/// interactions still land on the actual UI. Colors read from the palette
+/// custom properties so scenes always match the blended palette.
+const THREEJS_LIBRARY: &str = r#"
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"}}
+</script>
+<script type="module">
+(function(){
+  var sig = document.body.getAttribute('data-signature-motion') || '';
+  if (!sig.startsWith('3d-')) return;
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  // Read palette hex from CSS custom properties. Falls back to a warm brick.
+  function cssHex(name, fallback) {
+    var v = getComputedStyle(document.body).getPropertyValue(name).trim();
+    return (v.length >= 4 && v[0] === '#') ? v : fallback;
+  }
+  var ACCENT = cssHex('--accent',  '#d76146');
+  var INK    = cssHex('--ink',     '#1c1a17');
+  var PAPER  = cssHex('--paper',   '#f5efe4');
+
+  // Container: sits behind the hero, non-interactive, follows hero size.
+  var hero = document.querySelector('section:first-of-type, header:first-of-type');
+  if (!hero) return;
+  var host = document.createElement('div');
+  host.id = '__sig_scene';
+  host.style.cssText = 'position:absolute;inset:0;z-index:0;pointer-events:none;overflow:hidden;';
+  if (getComputedStyle(hero).position === 'static') hero.style.position = 'relative';
+  hero.insertBefore(host, hero.firstChild);
+  // Ensure hero content sits above the scene.
+  var kids = hero.children;
+  for (var i = 0; i < kids.length; i++) {
+    if (kids[i] === host) continue;
+    if (getComputedStyle(kids[i]).position === 'static') kids[i].style.position = 'relative';
+    kids[i].style.zIndex = '1';
+  }
+
+  import('three').then(function(THREE) {
+    var renderer = new THREE.WebGLRenderer({ alpha:true, antialias:true, powerPreference:'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x000000, 0);
+    var scene = new THREE.Scene();
+    var camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    camera.position.z = 4;
+    host.appendChild(renderer.domElement);
+
+    function resize() {
+      var w = host.clientWidth, h = host.clientHeight;
+      if (w < 10 || h < 10) return;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h; camera.updateProjectionMatrix();
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Helper: hex → THREE.Color
+    function C(h) { return new THREE.Color(h); }
+
+    var mesh, points, uniforms, paused = false, rafId = null;
+    var scenes = {
+      'orb-glow': function(){
+        var geo = new THREE.IcosahedronGeometry(1.4, 1);
+        var mat = new THREE.MeshBasicMaterial({ color: C(ACCENT), wireframe: true, transparent: true, opacity: 0.55 });
+        mesh = new THREE.Mesh(geo, mat);
+        scene.add(mesh);
+        // Soft additive halo — a second, larger, fainter mesh.
+        var glow = new THREE.Mesh(
+          new THREE.IcosahedronGeometry(1.9, 1),
+          new THREE.MeshBasicMaterial({ color: C(ACCENT), wireframe: true, transparent: true, opacity: 0.15 })
+        );
+        scene.add(glow);
+        return function tick(t){
+          mesh.rotation.x = t * 0.00015;
+          mesh.rotation.y = t * 0.00022;
+          mesh.scale.setScalar(1 + Math.sin(t * 0.0008) * 0.06);
+          glow.rotation.x = -t * 0.0001;
+          glow.rotation.y = -t * 0.00013;
+          renderer.render(scene, camera);
+        };
+      },
+      'particle-drift': function(){
+        var N = 1200;
+        var positions = new Float32Array(N * 3);
+        var speeds = new Float32Array(N);
+        for (var i = 0; i < N; i++) {
+          positions[i*3+0] = (Math.random() - 0.5) * 10;
+          positions[i*3+1] = (Math.random() - 0.5) * 6;
+          positions[i*3+2] = (Math.random() - 0.5) * 4;
+          speeds[i] = 0.002 + Math.random() * 0.003;
+        }
+        var geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        var mat = new THREE.PointsMaterial({ color: C(ACCENT), size: 0.03, transparent: true, opacity: 0.45, sizeAttenuation: true });
+        points = new THREE.Points(geo, mat);
+        scene.add(points);
+        return function tick(t){
+          var pos = geo.attributes.position.array;
+          for (var i = 0; i < N; i++) {
+            pos[i*3+0] += speeds[i];
+            if (pos[i*3+0] > 5) pos[i*3+0] = -5;
+            pos[i*3+1] += Math.sin((t + i * 100) * 0.0005) * 0.001;
+          }
+          geo.attributes.position.needsUpdate = true;
+          renderer.render(scene, camera);
+        };
+      },
+      'wireframe': function(){
+        var geo = new THREE.TorusKnotGeometry(1.1, 0.32, 200, 20);
+        var mat = new THREE.MeshBasicMaterial({ color: C(ACCENT), wireframe: true, transparent: true, opacity: 0.6 });
+        mesh = new THREE.Mesh(geo, mat);
+        scene.add(mesh);
+        return function tick(t){
+          mesh.rotation.x = t * 0.00018;
+          mesh.rotation.y = t * 0.00024;
+          renderer.render(scene, camera);
+        };
+      },
+      'gradient-plane': function(){
+        uniforms = {
+          time: { value: 0 },
+          c1:   { value: C(ACCENT) },
+          c2:   { value: C(PAPER) },
+          c3:   { value: C(INK) }
+        };
+        var mat = new THREE.ShaderMaterial({
+          uniforms: uniforms,
+          vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+          fragmentShader:
+            'uniform float time; uniform vec3 c1; uniform vec3 c2; uniform vec3 c3; varying vec2 vUv; ' +
+            'void main(){ ' +
+              'float n = sin(vUv.x * 3.14 + time * 0.4) * 0.5 + 0.5; ' +
+              'float m = cos(vUv.y * 2.71 - time * 0.3) * 0.5 + 0.5; ' +
+              'vec3 col = mix(c2, c1, n); col = mix(col, c3, m * 0.15); ' +
+              'gl_FragColor = vec4(col, 0.35); }',
+          transparent: true,
+        });
+        mesh = new THREE.Mesh(new THREE.PlaneGeometry(20, 12), mat);
+        scene.add(mesh);
+        camera.position.z = 3;
+        return function tick(t){
+          uniforms.time.value = t * 0.001;
+          renderer.render(scene, camera);
+        };
+      },
+      'star-field': function(){
+        var N = 900;
+        var positions = new Float32Array(N * 3);
+        var sizes = new Float32Array(N);
+        for (var i = 0; i < N; i++) {
+          var r = 6 + Math.random() * 4;
+          var theta = Math.random() * Math.PI * 2;
+          var phi = Math.acos(2 * Math.random() - 1);
+          positions[i*3+0] = r * Math.sin(phi) * Math.cos(theta);
+          positions[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+          positions[i*3+2] = r * Math.cos(phi) - 6;
+          sizes[i] = 0.005 + Math.random() * 0.025;
+        }
+        var geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute('size',     new THREE.BufferAttribute(sizes, 1));
+        var mat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.02, transparent: true, opacity: 0.7 });
+        points = new THREE.Points(geo, mat);
+        scene.add(points);
+        return function tick(t){
+          points.rotation.y = t * 0.00005;
+          points.rotation.x = t * 0.00003;
+          // Twinkle via material opacity oscillation.
+          mat.opacity = 0.55 + Math.sin(t * 0.001) * 0.15;
+          renderer.render(scene, camera);
+        };
+      },
+      'flowing-lines': function(){
+        // Ribbon-like lines using thin extruded curves.
+        var group = new THREE.Group();
+        var LINES = 8;
+        for (var l = 0; l < LINES; l++) {
+          var pts = [];
+          for (var s = 0; s < 60; s++) {
+            var x = (s / 60 - 0.5) * 8;
+            var y = Math.sin(s * 0.22 + l * 0.9) * (0.8 - l * 0.06);
+            var z = -l * 0.3;
+            pts.push(new THREE.Vector3(x, y, z));
+          }
+          var curve = new THREE.CatmullRomCurve3(pts);
+          var geo = new THREE.TubeGeometry(curve, 60, 0.02 + l * 0.005, 8, false);
+          var mat = new THREE.MeshBasicMaterial({ color: C(ACCENT), transparent: true, opacity: 0.25 + l * 0.03 });
+          group.add(new THREE.Mesh(geo, mat));
+        }
+        scene.add(group);
+        mesh = group;
+        return function tick(t){
+          group.rotation.z = Math.sin(t * 0.0003) * 0.15;
+          group.position.y = Math.sin(t * 0.0005) * 0.25;
+          renderer.render(scene, camera);
+        };
+      }
+    };
+
+    var sceneKey = sig.replace(/^3d-/, '');
+    var loop = (scenes[sceneKey] || scenes['orb-glow'])();
+
+    function frame(t){
+      if (paused) { rafId = requestAnimationFrame(frame); return; }
+      loop(t);
+      rafId = requestAnimationFrame(frame);
+    }
+    document.addEventListener('visibilitychange', function(){ paused = document.hidden; });
+    rafId = requestAnimationFrame(frame);
+  }).catch(function(err){
+    // three.js CDN blocked or offline — degrade silently, no scene shown.
+    host.remove();
+  });
+})();
+</script>
+"#;
+
+/// Motion JS — small IIFE that installs the IntersectionObserver reveal and
+/// activates the parallax + magnetic-CTA signatures when they're picked.
+const MOTION_JS: &str = r#"
+<script>
+(function(){
+  var reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduced) {
+    document.querySelectorAll('section, nav, footer, header, aside, main, article')
+      .forEach(function(el){ el.classList.add('motion-in'); });
+    return;
+  }
+  // Scroll-triggered reveal.
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if (e.isIntersecting) {
+        e.target.classList.add('motion-in');
+        io.unobserve(e.target);
+      }
+    });
+  }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+  document.querySelectorAll('section, nav, footer, header, aside, main, article')
+    .forEach(function(el){ io.observe(el); });
+
+  var sig = document.body.getAttribute('data-signature-motion') || '';
+
+  // parallax-hero: translate hero image slower than scroll.
+  if (sig === 'parallax-hero') {
+    var hero = document.querySelector('section:first-of-type img, section:first-of-type .hero-img');
+    if (hero) {
+      var raf = null;
+      var onScroll = function(){
+        if (raf) return;
+        raf = requestAnimationFrame(function(){
+          var y = window.scrollY * 0.4;
+          hero.style.transform = 'translate3d(0, ' + y + 'px, 0)';
+          raf = null;
+        });
+      };
+      window.addEventListener('scroll', onScroll, { passive: true });
+    }
+  }
+
+  // magnetic-cta: primary CTA translates slightly toward the cursor.
+  if (sig === 'magnetic-cta') {
+    var cta = document.querySelector('section:first-of-type a[href], section:first-of-type button');
+    if (cta) {
+      cta.addEventListener('mousemove', function(e){
+        var r = cta.getBoundingClientRect();
+        var dx = (e.clientX - (r.left + r.width/2)) * 0.15;
+        var dy = (e.clientY - (r.top + r.height/2)) * 0.25;
+        cta.style.transform = 'translate3d(' + dx + 'px, ' + dy + 'px, 0)';
+      });
+      cta.addEventListener('mouseleave', function(){
+        cta.style.transform = '';
+      });
+    }
+  }
+})();
+</script>
+"#;
 
 /// Assemble the final HTML: shell + palette + theme fonts + variant styles + variant HTMLs (with placeholders filled).
 fn assemble_html(
@@ -2058,6 +2920,237 @@ fn strip_tags(s: &str) -> String {
 /// Spawn a background critique. We don't block the design surface on it; the
 /// LLM sends CritiqueFixes when ready. Errors are swallowed silently — the
 /// critique is an assistive polish, not a hard requirement.
+/// Skeleton-first APP flow (v0.6). Generates wireframes for every declared
+/// page — INCLUDING home — using the LLM to invent a consistent app shell
+/// (sidebar/topbar) shared across all pages. Returns the home skeleton HTML
+/// (which becomes the initial `DesignUpdate`) along with usage.
+async fn handle_app_skeleton_phase(
+    project_slug: &str,
+    idea:         &str,
+    other_pages:  &[String],
+    provider:     &Provider,
+    tx:           &Sender<AppEvent>,
+    stop:         Arc<AtomicBool>,
+) -> Result<(String, ai::Usage)> {
+    // Compose the page list: home + others. Slugify names, dedupe.
+    let mut list: Vec<(String, String)> = Vec::new();
+    list.push(("home".into(), "Home".into()));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from(["home".into()]);
+    for raw in other_pages {
+        let name = raw.trim();
+        if name.is_empty() { continue; }
+        let slug = projects::slugify(name);
+        if slug.is_empty() || !seen.insert(slug.clone()) { continue; }
+        list.push((slug, name.to_string()));
+    }
+    if list.len() < 2 {
+        // No sibling pages inferred — fall back to a home-only wireframe.
+        // Still useful so the user can iterate the shell before building.
+    }
+
+    let _ = tx.send(AppEvent::StatusUpdate(
+        format!("Wireframing {} pages…", list.len())
+    ));
+
+    // Seed the manifest so tabs appear immediately.
+    let mut manifest = projects::PagesManifest {
+        pages: list.iter().map(|(slug, name)| projects::PageInfo {
+            slug: slug.clone(), name: name.clone(),
+            built: false, has_skeleton: false,
+        }).collect(),
+        active: "home".into(),
+    };
+    let _ = projects::write_pages_manifest(project_slug, &manifest);
+    push_pages(tx, project_slug);
+
+    // Batch LLM call — one round-trip generates every wireframe.
+    let system = ai::prompts::SKELETON_BATCH_SYSTEM;
+    let user   = ai::prompts::skeleton_batch_user_fresh(idea, &list);
+    let comp = provider.complete_streaming_cached(
+        system,
+        ai::prompts::system_context(crate::session::Mode::App),
+        &user, 14_000,
+        Box::new(|_| {}),
+        stop,
+    ).await?;
+    let text = ai::clean(comp.text);
+    let usage = usage_or_estimate(comp.usage, system, &user, &text);
+
+    // Parse the {pages: [{slug, html}, …]} envelope.
+    let stripped = text.trim()
+        .trim_start_matches("```json").trim_start_matches("```")
+        .trim_end_matches("```").trim();
+    let value: serde_json::Value = serde_json::from_str(stripped)
+        .map_err(|e| anyhow::anyhow!("skeleton batch JSON parse failed: {e}"))?;
+    let arr = value.get("pages").and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("skeleton batch missing `pages` array"))?;
+
+    let mut home_html: Option<String> = None;
+    let total = arr.len() as u32;
+    let mut done = 0u32;
+    for entry in arr {
+        let slug = entry.get("slug").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let html = entry.get("html").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if slug.is_empty() || html.is_empty() { continue; }
+        let _ = projects::write_skeleton(project_slug, &slug, &html);
+        if let Some(p) = manifest.pages.iter_mut().find(|p| p.slug == slug) {
+            p.has_skeleton = true;
+        }
+        if slug == "home" { home_html = Some(html); }
+        done += 1;
+        let _ = tx.send(AppEvent::SkeletonProgress {
+            current: done, total, page: slug,
+        });
+    }
+    let _ = projects::write_pages_manifest(project_slug, &manifest);
+    push_pages(tx, project_slug);
+    if let Ok(m) = projects::read_pages_manifest(project_slug) {
+        let json = serde_json::to_string(&m.pages).unwrap_or_else(|_| "[]".into());
+        let _ = tx.send(AppEvent::SkeletonsReady { pages: json });
+    }
+
+    let home = home_html.ok_or_else(||
+        anyhow::anyhow!("wireframe batch didn't include a home page"))?;
+    Ok((home, usage))
+}
+
+/// Cheap LLM call: given only the brief (no HTML yet), suggest 4 sibling
+/// pages this app would plausibly have. Used by APP-mode start_design when
+/// the user skipped the pre-page picker.
+async fn suggest_pages_from_brief(provider: &Provider, idea: &str) -> Vec<String> {
+    let system = ai::prompts::NEXT_PAGES_SUGGEST_SYSTEM;
+    let user   = ai::prompts::next_pages_suggest_user(idea, &[]);
+    let comp = match provider.complete(system, &user, 200).await {
+        Ok(c) => c, Err(_) => return Vec::new(),
+    };
+    let cleaned = ai::clean(comp.text);
+    let json_str = cleaned.trim()
+        .trim_start_matches("```json").trim_start_matches("```")
+        .trim_end_matches("```").trim();
+    #[derive(serde::Deserialize)]
+    struct Suggestion { name: String, #[allow(dead_code)] slug: String }
+    let parsed: Vec<Suggestion> = serde_json::from_str(json_str).unwrap_or_default();
+    parsed.into_iter().map(|s| s.name).take(4).collect()
+}
+
+// ── Batch skeleton generation (APP mode) ───────────────────────────────
+//
+// Fire-and-forget spawner. Fires ONE LLM call that returns a wireframe HTML
+// per requested page, saves each to `{slug}--{page}.skeleton.html`, updates
+// the manifest's `has_skeleton` flag, and emits `SkeletonsReady` so the UI
+// can show dashed-tab indicators. Any errors are surfaced as a chat note but
+// don't block anything else.
+fn spawn_skeleton_batch(
+    project_slug: String,
+    idea:         String,
+    home_html:    String,
+    page_names:   Vec<String>,
+    provider:     Provider,
+    tx:           Sender<AppEvent>,
+    stop:         Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let _ = generate_skeletons(
+            &project_slug, &idea, &home_html, &page_names, &provider, &tx, stop,
+        ).await;
+    });
+}
+
+async fn generate_skeletons(
+    project_slug: &str,
+    idea:         &str,
+    home_html:    &str,
+    page_names:   &[String],
+    provider:     &Provider,
+    tx:           &Sender<AppEvent>,
+    stop:         Arc<AtomicBool>,
+) -> Result<()> {
+    // Resolve each declared name to (slug, name), skipping "home" and
+    // anything already in the manifest.
+    let mut manifest = projects::read_pages_manifest(project_slug).unwrap_or_default();
+    let mut to_wireframe: Vec<(String, String)> = Vec::new();
+    for raw in page_names {
+        let name = raw.trim();
+        if name.is_empty() { continue; }
+        let slug = projects::slugify(name);
+        if slug == "home" || slug.is_empty() { continue; }
+        if manifest.pages.iter().any(|p| p.slug == slug && p.built) { continue; }
+        // Add to manifest as skeleton entry if not present.
+        if !manifest.pages.iter().any(|p| p.slug == slug) {
+            manifest.pages.push(projects::PageInfo {
+                slug: slug.clone(), name: name.to_string(),
+                built: false, has_skeleton: false,
+            });
+        }
+        to_wireframe.push((slug, name.to_string()));
+    }
+    if to_wireframe.is_empty() { return Ok(()); }
+    // Write the extended manifest so the UI sees the skeleton entries even
+    // before the LLM finishes.
+    let _ = projects::write_pages_manifest(project_slug, &manifest);
+    push_pages(tx, project_slug);
+    let _ = tx.send(AppEvent::StatusUpdate(
+        format!("Wireframing {} pages…", to_wireframe.len())
+    ));
+
+    // One LLM call, JSON output. Non-streaming — the JSON is large and we
+    // don't want raw text flashing in the preview iframe.
+    let system = ai::prompts::SKELETON_BATCH_SYSTEM;
+    let user   = ai::prompts::skeleton_batch_user(idea, home_html, &to_wireframe);
+
+    let comp = provider.complete_streaming_cached(
+        system,
+        ai::prompts::system_context(crate::session::Mode::App),
+        &user, 12_000,
+        Box::new(|_| {}),
+        stop,
+    ).await?;
+    let text = ai::clean(comp.text);
+
+    // Parse the {pages: [{slug, html}, …]} envelope. Tolerant to leading
+    // whitespace and code fences.
+    let stripped = text.trim()
+        .trim_start_matches("```json").trim_start_matches("```")
+        .trim_end_matches("```").trim();
+    let value: serde_json::Value = serde_json::from_str(stripped)
+        .map_err(|e| anyhow::anyhow!("skeleton batch JSON parse failed: {e}"))?;
+    let arr = value.get("pages").and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("skeleton batch missing `pages` array"))?;
+
+    let total = to_wireframe.len() as u32;
+    let mut done = 0u32;
+    for entry in arr {
+        let slug = entry.get("slug").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let html = entry.get("html").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if slug.is_empty() || html.is_empty() { continue; }
+        let _ = projects::write_skeleton(project_slug, slug, html);
+        // Reload manifest and mark has_skeleton = true for this slug.
+        if let Ok(mut m) = projects::read_pages_manifest(project_slug) {
+            if let Some(p) = m.pages.iter_mut().find(|p| p.slug == slug) {
+                p.has_skeleton = true;
+            }
+            let _ = projects::write_pages_manifest(project_slug, &m);
+        }
+        done += 1;
+        let _ = tx.send(AppEvent::SkeletonProgress {
+            current: done, total, page: slug.to_string(),
+        });
+    }
+
+    // Final push so the UI's tab bar reflects the has_skeleton flags.
+    push_pages(tx, project_slug);
+    // Compact SkeletonsReady payload with the current manifest so the UI can
+    // render dashed tabs without a manifest re-read roundtrip.
+    if let Ok(m) = projects::read_pages_manifest(project_slug) {
+        let json = serde_json::to_string(&m.pages).unwrap_or_else(|_| "[]".into());
+        let _ = tx.send(AppEvent::SkeletonsReady { pages: json });
+    }
+    let _ = tx.send(AppEvent::AssistantMessage(format!(
+        "Wireframed {done} pages. Click any tab to preview — hit \"Build this page\" to upgrade a wireframe to full fidelity."
+    )));
+    Ok(())
+}
+
 fn spawn_critique(html: String, mode: crate::session::Mode, provider: Provider, tx: Sender<AppEvent>) {
     tokio::spawn(async move {
         let _ = run_critique(html, mode, provider, tx).await;

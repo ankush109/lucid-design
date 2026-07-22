@@ -273,6 +273,103 @@ Then output the HTML. Start with the archetype meta tag, then DOCTYPE, then the 
 "#)
 }
 
+// ── Skeleton batch generation (APP mode) ────────────────────────────────
+//
+// After the home page of a multi-page app lands, we ask the LLM to produce
+// low-fidelity wireframe HTML for every other declared page in ONE call.
+// These skeletons show the user the whole app's structure immediately; the
+// user then clicks any tab to upgrade that page to full fidelity.
+
+pub const SKELETON_BATCH_SYSTEM: &str = "\
+You are a UI wireframe generator for a multi-page app. Output a low-fidelity \
+HTML wireframe for EACH requested page. Purpose: user reviews the app's whole \
+structural map before spending tokens on any full-fidelity build.
+
+CRITICAL — shared shell:
+- INVENT one consistent app shell (sidebar / topbar / nav / footer) and use it \
+verbatim across every page. Same nav items, same order, same layout. Only the \
+active nav item changes per page, and the MAIN WORKSPACE region varies per page.
+- The shell must include a nav link to EVERY page in the requested list (use \
+href=\"./{page-slug}.html\" for each). The current page's nav item is marked \
+active (class=\"active\").
+- The idea determines the shell archetype: dashboard/admin → sidebar-left + \
+topbar; e-commerce back-office → topbar-only + dense workspace; CRM → sidebar + \
+detail-pane split. Pick the archetype from the idea and apply it to every page.
+
+Styling rules — WIREFRAME ONLY (no full fidelity):
+- Grayscale only. `color: #555` text, `border-color: #bbb`, `background: white`.
+- Placeholder box shapes with 1px solid gray borders (`class=\"wf-box\"`); use \
+dashed borders for media placeholders (`class=\"wf-box dashed\"`).
+- System font stack, no custom fonts.
+- No colors, no shadows, no gradients, no motion.
+- Add this style block INSIDE each page's <head>:
+  <style>
+  .wireframe *{background:transparent!important;color:#555!important;border-color:#bbb!important;box-shadow:none!important;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif!important;}
+  .wireframe .wf-box{border:1px solid #bbb;padding:16px;margin:8px 0;background:#fafafa;}
+  .wireframe .wf-box.dashed{border-style:dashed;background:transparent;}
+  .wireframe .wf-caption{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#999;margin-bottom:6px;}
+  .wireframe nav.side{width:200px;border-right:1px solid #ddd;padding:16px;background:#fafafa;}
+  .wireframe nav.side a{display:block;padding:8px 10px;color:#555;text-decoration:none;font-size:13px;}
+  .wireframe nav.side a.active{background:#eee;font-weight:600;}
+  .wireframe header.top{padding:12px 20px;border-bottom:1px solid #ddd;background:#fafafa;}
+  .wireframe main{flex:1;padding:20px;overflow:auto;}
+  .wireframe .app-shell{display:flex;min-height:100vh;}
+  </style>
+- Wrap the entire body in `<body class=\"wireframe\"><div class=\"app-shell\">…</div></body>`.
+
+Rules for each page's workspace:
+- Realistic domain labels — never Lorem Ipsum. If page is 'Workouts', show \
+columns 'Date · Type · Duration · Volume'. If 'Orders', show 'Order # · \
+Customer · Items · Total · Status'.
+- Every workspace region annotated with a `<div class=\"wf-caption\">Header</div>` \
+label so the user reads the intent.
+- Include `<meta name=\"page-mode\" content=\"skeleton\">` in each doc.
+- Full DOCTYPE + head + body per page. Complete documents.
+
+Output STRICTLY a JSON object:
+{ \"pages\": [ { \"slug\": \"<slug>\", \"html\": \"<!DOCTYPE …full doc…>\" }, … ] }
+No prose. No markdown fences. No extra keys. Every requested page must appear \
+exactly once. HTML strings can be long — include the full document per page.";
+
+/// Skeleton-first flow: no home HTML yet, the LLM invents the app shell.
+/// This is what the new APP-mode start_design uses. `pages` MUST include
+/// "home" as the first entry so the nav has a real target.
+pub fn skeleton_batch_user_fresh(idea: &str, pages: &[(String, String)]) -> String {
+    let list = pages.iter()
+        .map(|(slug, name)| format!("  - slug: {slug} — name: {name}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Project idea: {idea}\n\n\
+        Pages to wireframe (include a nav link to every page on every page's \
+        shell; mark the current one active):\n{list}\n\n\
+        Return the JSON with one wireframe HTML per page. The home page is \
+        included in the list and gets wireframed like any other."
+    )
+}
+
+/// Legacy: batch skeleton with an existing home HTML as shell donor (used
+/// when the home page was already built, e.g. adding sub-pages later).
+pub fn skeleton_batch_user(idea: &str, home_html: &str, pages: &[(String, String)]) -> String {
+    let bounded_home = if home_html.len() > 20_000 {
+        let head = &home_html[..15_000];
+        let tail = &home_html[home_html.len()-4_000..];
+        format!("{head}\n<!-- middle truncated -->\n{tail}")
+    } else {
+        home_html.to_string()
+    };
+    let list = pages.iter()
+        .map(|(slug, name)| format!("  - slug: {slug} — name: {name}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Project idea: {idea}\n\nHome page HTML (shell donor — inherit its \
+        sidebar/topbar/nav for these NEW pages):\n{bounded_home}\n\nNew pages \
+        to wireframe (do NOT include home — it already exists):\n{list}\n\n\
+        Return the JSON with one wireframe HTML per new page."
+    )
+}
+
 pub const NEXT_PAGES_SUGGEST_SYSTEM: &str = "\
 You are a UI information-architect. Given a product idea and the just-designed \
 home page's existing section ids, list up to 4 top-level PAGES (not in-page \
@@ -331,9 +428,25 @@ Return 1-3 concrete design improvements as a JSON array (per the system prompt f
 }
 
 pub const ELEMENT_REFINE_SYSTEM: &str = "\
-You are editing a single HTML element inside a larger design. Return ONLY \
-the replacement HTML for that one element — same tag, no wrapping, no page \
-structure, no other siblings.
+You are editing ONE HTML element inside a larger design. You will receive \
+that element's outer HTML — you return a replacement for JUST THAT ELEMENT. \
+Never a full document. Never siblings. Never <html>, <head>, <body>, \
+<!DOCTYPE>, <style>, or <script> tags at the top level.
+
+CRITICAL — output shape:
+- The FIRST token of your output MUST be the SAME opening tag as the input's \
+first token. If input starts with `<section id=\"hero\">`, output starts with \
+`<section id=\"hero\">`. Same tag, same id.
+- If the user's request sounds page-wide (e.g. \"change the design\", \"make it \
+more modern\", \"redesign this\"), interpret it as changes to THIS element only — \
+new palette accents applied via inline styles on this element, different layout \
+of THIS element's children, different copy INSIDE this element. Never rewrite \
+the whole page.
+- If the user's request truly cannot be honored at element scope (e.g. \"add a \
+pricing section\"), still return the element unchanged and instead add a \
+data-refine-note attribute explaining why. Example: \
+`<section id=\"hero\" data-refine-note=\"That's a page-level change; use a \
+regular refine instead\">…same content…</section>`.
 
 Rules:
 - Apply visual changes via an inline `style` attribute on the element itself \
@@ -341,12 +454,12 @@ so the change is fully scoped and cannot affect siblings.
 - Do not modify or add global CSS classes.
 - Preserve the element's id and existing classes unless the user explicitly \
 asks to change them.
-- Preserve the element's inner text and child structure unless the user \
-asks otherwise.
-- If a text change is requested, preserve any nested structure that the \
-user did not ask about.
+- Preserve the element's inner text and child structure unless the user asks \
+otherwise. If asked for a text change, preserve nested structure the user did \
+not ask about.
 
-Output ONLY the raw HTML for that single element. No markdown. No prose.";
+Output ONLY the raw HTML for that single element. No markdown fences. No \
+prose. No wrapping tags.";
 
 pub fn element_refine_user(selector: &str, outer_html: &str, feedback: &str) -> String {
     format!(r#"Selector: {selector}

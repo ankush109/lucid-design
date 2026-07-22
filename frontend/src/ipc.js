@@ -190,6 +190,17 @@ export function installIpcBridge() {
         s.setGenerating(false);
         break;
       }
+      case 'skeletons_ready': {
+        s.applySkeletonsReady(msg.pages || []);
+        break;
+      }
+      case 'skeleton_progress': {
+        s.setSkeletonProgress({
+          current: msg.current, total: msg.total, page: msg.page,
+        });
+        s.setStatus('busy', `Wireframing ${msg.current}/${msg.total}: ${msg.page}…`);
+        break;
+      }
       default:
         break;
     }
@@ -197,15 +208,33 @@ export function installIpcBridge() {
   };
 }
 
-// Debounced save_chat mirror. Callers just push messages via store actions
-// and this hook (installed once) mirrors the chat to Rust.
+// Debounced save_chat mirror. Callers push messages via store actions and
+// this hook (installed once) mirrors the chat to Rust.
+//
+// Project-switch safety: every save carries the slug it was captured on.
+// Rust verifies the slug matches its current_project before writing, so a
+// stale debounced save can't clobber the wrong project's chat. On project
+// change, we also cancel any pending timer + reset lastKey so the next
+// mirror pass evaluates against the incoming project cleanly.
 export function installChatMirror() {
   let timer = null;
   let lastKey = '';
+  let lastSlug = null;
   useStore.subscribe((state, prev) => {
-    if (state.messages === prev.messages && state.session.currentProject === prev.session.currentProject) return;
-    if (!state.session.currentProject) return;
-    // Only mirror stable text/critique entries, matching legacy shape.
+    const slug = state.session.currentProject?.slug || null;
+    if (!slug) return;
+
+    // Project switched — kill any stale timer and reset. Do not save until
+    // the new project's chat lands from the ProjectOpened event.
+    if (slug !== lastSlug) {
+      if (timer) { clearTimeout(timer); timer = null; }
+      lastKey = '';
+      lastSlug = slug;
+      return;
+    }
+
+    if (state.messages === prev.messages) return;
+
     const entries = state.messages
       .map(m => {
         if (m.kind === 'text') return { role: m.role, label: m.label, text: m.content };
@@ -216,10 +245,13 @@ export function installChatMirror() {
     const key = JSON.stringify(entries);
     if (key === lastKey) return;
     lastKey = key;
+
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
-      try { ipcSend('save_chat', key); } catch(_) {}
+      try {
+        ipcSend('save_chat', JSON.stringify({ slug, chat: entries }));
+      } catch(_) {}
     }, 250);
   });
 }

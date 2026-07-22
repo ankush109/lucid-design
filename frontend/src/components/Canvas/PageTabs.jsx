@@ -43,15 +43,23 @@ export default function PageTabs() {
   return (
     <div className="page-tabs">
       <div className="page-tabs-inner">
-        {tabs.map(p => (
-          <button
-            key={p.slug}
-            className={`page-tab${p.slug === active ? ' active' : ''}`}
-            onClick={() => switchPage(p.slug)}
-          >
-            {p.name}
-          </button>
-        ))}
+        {tabs.map(p => {
+          // Un-built pages that have a skeleton get a dashed tab with a
+          // small "wireframe" glyph so the user knows one click will
+          // preview the wireframe.
+          const isWire = p.built === false && p.has_skeleton === true;
+          return (
+            <button
+              key={p.slug}
+              className={`page-tab${p.slug === active ? ' active' : ''}${isWire ? ' wireframe' : ''}`}
+              onClick={() => switchPage(p.slug)}
+              title={isWire ? 'Wireframe — click to preview, then Build to upgrade' : ''}
+            >
+              {isWire && <span className="wire-dot" aria-hidden />}
+              {p.name}
+            </button>
+          );
+        })}
       </div>
       <button className="page-tab page-tab-new" onClick={promptNewPage} title="Design a new page in this project">+ page</button>
     </div>

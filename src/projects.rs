@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -125,6 +126,7 @@ pub fn write(slug: &str, html: &str) -> Result<()> {
 pub fn delete(slug: &str) -> Result<()> {
     let d = dir()?;
     let _ = fs::remove_file(d.join(format!("{}.html", slug)));
+    let _ = fs::remove_file(d.join(format!("{}.skeleton.html", slug)));
     let _ = fs::remove_file(d.join(format!("{}.name", slug)));
     let _ = fs::remove_file(d.join(format!("{}.chat.json", slug)));
     let _ = fs::remove_file(d.join(format!("{}.chat.jsonl", slug)));
@@ -175,7 +177,18 @@ pub struct PageInfo {
     pub slug: String,
     /// Display name: "Home", "Settings", "Users".
     pub name: String,
+    /// `false` when only the skeleton wireframe exists (auto-generated after
+    /// home page). `true` once the user has upgraded the page to full
+    /// fidelity via the "Build this page" action.
+    #[serde(default = "default_true")]
+    pub built: bool,
+    /// `true` once the batch skeleton generator has produced a wireframe
+    /// for this page (i.e. `{slug}--{page}.skeleton.html` exists).
+    #[serde(default)]
+    pub has_skeleton: bool,
 }
+
+fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PagesManifest {
@@ -186,7 +199,7 @@ pub struct PagesManifest {
 impl Default for PagesManifest {
     fn default() -> Self {
         Self {
-            pages:  vec![PageInfo { slug: "home".into(), name: "Home".into() }],
+            pages:  vec![PageInfo { slug: "home".into(), name: "Home".into(), built: true, has_skeleton: false }],
             active: "home".into(),
         }
     }
@@ -230,6 +243,41 @@ pub fn write_page(project_slug: &str, page_slug: &str, html: &str) -> Result<()>
     Ok(())
 }
 
+/// Skeleton-file counterpart. `{slug}--{page}.skeleton.html` for sub-pages;
+/// `{slug}.skeleton.html` for the home page. Kept as a sibling so we can
+/// toggle between the wireframe and the built version freely.
+fn skeleton_file(project_slug: &str, page_slug: &str) -> PathBuf {
+    let d = dir().unwrap_or_else(|_| PathBuf::from("."));
+    if page_slug == "home" {
+        d.join(format!("{}.skeleton.html", project_slug))
+    } else {
+        d.join(format!("{}--{}.skeleton.html", project_slug, page_slug))
+    }
+}
+
+pub fn read_skeleton(project_slug: &str, page_slug: &str) -> Result<String> {
+    let path = skeleton_file(project_slug, page_slug);
+    Ok(fs::read_to_string(&path)?)
+}
+
+pub fn write_skeleton(project_slug: &str, page_slug: &str, html: &str) -> Result<()> {
+    let path = skeleton_file(project_slug, page_slug);
+    fs::write(&path, html)?;
+    Ok(())
+}
+
+pub fn has_built_page(project_slug: &str, page_slug: &str) -> bool {
+    page_file(project_slug, page_slug).exists()
+        && !std::fs::read_to_string(page_file(project_slug, page_slug))
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+}
+
+pub fn has_skeleton(project_slug: &str, page_slug: &str) -> bool {
+    skeleton_file(project_slug, page_slug).exists()
+}
+
 /// Add a new sub-page to a project. Slugifies the display name and dedupes.
 /// Returns the resolved page slug.
 pub fn add_page(project_slug: &str, display_name: &str) -> Result<String> {
@@ -248,7 +296,7 @@ pub fn add_page(project_slug: &str, display_name: &str) -> Result<String> {
 
     let display = display_name.trim();
     let display = if display.is_empty() { &base } else { display };
-    manifest.pages.push(PageInfo { slug: base.clone(), name: display.into() });
+    manifest.pages.push(PageInfo { slug: base.clone(), name: display.into(), built: true, has_skeleton: false });
     manifest.active = base.clone();
     write_pages_manifest(project_slug, &manifest)?;
     // Ensure an empty file exists so read_page doesn't fail before first generation.
@@ -302,7 +350,18 @@ pub fn read_session(project_slug: &str) -> Result<Session> {
     let path = session_path(project_slug)?;
     if path.exists() {
         let s = fs::read_to_string(&path).unwrap_or_default();
-        if let Ok(sess) = serde_json::from_str::<Session>(&s) {
+        if let Ok(mut sess) = serde_json::from_str::<Session>(&s) {
+            // Older session files may not carry a brief. If the home HTML
+            // has a <title>, use it — beats falling back to the project's
+            // display name (which is often terse like "Ok" or "Fintech")
+            // and causes try_different_layout to design against the wrong
+            // subject.
+            if sess.brief.is_empty() {
+                if let Some(t) = read(project_slug).ok().as_deref().and_then(extract_title) {
+                    sess.brief = t;
+                    let _ = write_session(project_slug, &sess);
+                }
+            }
             return Ok(sess);
         }
     }
@@ -310,9 +369,18 @@ pub fn read_session(project_slug: &str) -> Result<Session> {
     let mut sess = Session::default();
     if let Ok(html) = read(project_slug) {
         sess.mode = classify_html_mode(&html);
+        if let Some(t) = extract_title(&html) { sess.brief = t; }
     }
     let _ = write_session(project_slug, &sess);
     Ok(sess)
+}
+
+/// Pull the `<title>` text out of an HTML document, best-effort.
+fn extract_title(html: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(?is)<title[^>]*>([^<]{1,200})</title>").ok()?;
+    let cap = re.captures(html)?;
+    let s = cap.get(1)?.as_str().trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 pub fn write_session(project_slug: &str, sess: &Session) -> Result<()> {

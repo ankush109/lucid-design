@@ -4,6 +4,7 @@ compile_error!("lucid-design only runs on macOS (requires WKWebView + Cocoa).");
 mod ai;
 mod config;
 mod knowledge;
+mod orchestrator;
 mod pipeline;
 mod projects;
 mod scraper;
@@ -165,6 +166,17 @@ fn main() -> Result<()> {
                 }
                 pipeline::AppEvent::ModeClarify { brief } => {
                     serde_json::json!({ "type":"mode_clarify", "brief": brief })
+                }
+                pipeline::AppEvent::SkeletonsReady { pages } => {
+                    let value: serde_json::Value = serde_json::from_str(pages)
+                        .unwrap_or_else(|_| serde_json::json!([]));
+                    serde_json::json!({ "type":"skeletons_ready", "pages": value })
+                }
+                pipeline::AppEvent::SkeletonProgress { current, total, page } => {
+                    serde_json::json!({
+                        "type":"skeleton_progress",
+                        "current": current, "total": total, "page": page,
+                    })
                 }
                 pipeline::AppEvent::TokenUsage {
                     turn_input, turn_output,
